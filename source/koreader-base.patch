@@ -4584,10 +4584,10 @@ index 00000000..fa87350b
 +#endif
 diff --git a/switch/main.c b/switch/main.c
 new file mode 100644
-index 00000000..83f2ecc3
+index 00000000..364658c9
 --- /dev/null
 +++ b/switch/main.c
-@@ -0,0 +1,451 @@
+@@ -0,0 +1,467 @@
 +/*
 +    KOReader for Nintendo Switch: application entry point.
 +
@@ -5012,7 +5012,23 @@ index 00000000..83f2ecc3
 +    psmInitialize();
 +    lblInitialize();
 +    nifmInitialize(NifmServiceType_User);
-+    socketInitializeDefault();
++    /* libnx's default socket config uses small TCP buffers (~64 KiB receive, sb_efficiency 4),
++       which throttles large downloads (e.g. big CBZ comics) to a crawl. Give it room: a 1 MiB
++       receive window and more buffers per socket. Costs ~13 MiB of transfer memory, fine in
++       application mode and still modest for applet mode. */
++    static const SocketInitConfig socket_config = {
++        .tcp_tx_buf_size     = 0x10000,   /* 64 KiB  */
++        .tcp_rx_buf_size     = 0x20000,   /* 128 KiB */
++        .tcp_tx_buf_max_size = 0x80000,   /* 512 KiB */
++        .tcp_rx_buf_max_size = 0x100000,  /* 1 MiB   */
++        .udp_tx_buf_size     = 0x2400,
++        .udp_rx_buf_size     = 0xA500,
++        .sb_efficiency       = 8,
++        .num_bsd_sessions    = 3,
++        .bsd_service_type    = BsdServiceType_User,
++    };
++    if (R_FAILED(socketInitialize(&socket_config)))
++        socketInitializeDefault(); /* fall back to the stock buffers if the bigger pool is refused */
 +    ko_input_init();
 +
 +    pthread_attr_t attr;
