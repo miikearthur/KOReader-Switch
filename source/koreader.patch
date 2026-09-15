@@ -38,10 +38,10 @@ index 33f3652..dcec97b 100644
      elseif self.device:isPocketBook() then
 diff --git a/frontend/device/switch/device.lua b/frontend/device/switch/device.lua
 new file mode 100644
-index 0000000..a27d4e7
+index 0000000..ab132e9
 --- /dev/null
 +++ b/frontend/device/switch/device.lua
-@@ -0,0 +1,133 @@
+@@ -0,0 +1,145 @@
 +local Event = require("ui/event")
 +local Generic = require("device/generic/device")
 +local ffi = require("ffi")
@@ -50,6 +50,7 @@ index 0000000..a27d4e7
 +local C = ffi.C
 +
 +require("ffi/switch_h")
++require("ffi/linux_input_h") -- MSC_GYRO, for accelerometer rotation events
 +
 +local UIManager
 +
@@ -80,6 +81,9 @@ index 0000000..a27d4e7
 +    hasMultitouch = yes,
 +    hasColorScreen = yes,
 +    hasEinkScreen = no,
++    -- Auto-rotation from the accelerometer (Switch Lite always; regular/OLED only with Joy-Con attached).
++    -- KOReader's rotation menu, manual orientation and lock work regardless.
++    hasGSensor = yes,
 +    hasFrontlight = yes,
 +    hasWifiToggle = no,
 +    hasSeamlessWifiToggle = no,
@@ -120,6 +124,14 @@ index 0000000..a27d4e7
 +    }
 +    -- Like the framebuffer, touch coordinates are in the panel's native (landscape) orientation.
 +    self.input:registerEventAdjustHook(self.input.adjustTouchSwitchAxesAndMirrorX, self.screen:getScreenWidth() - 1)
++
++    -- Accelerometer rotation: the native glue emits EV_MSC/MSC_GYRO; route it to the standard gyro
++    -- handler (Generic.init turns handleGyroEv into handleMiscGyroEv unless the user disabled it).
++    self.input.handleMiscEv = function(this, ev)
++        if ev.code == C.MSC_GYRO then
++            return this:handleGyroEv(ev)
++        end
++    end
 +
 +    -- Reading involves long stretches without input: don't let the console dim the screen or go to sleep.
 +    C.ko_set_auto_sleep_inhibited(1)

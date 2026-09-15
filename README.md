@@ -62,7 +62,11 @@ On first launch, and after installing a newer version, KOReader unpacks itself t
 
 ## Hold it like a book
 
-KOReader runs in portrait. The splash screen asks you to **turn the console 90° clockwise**: the power and volume buttons end up on the right, the USB-C port on the left. If you'd rather hold it the other way round, pick the inverted portrait orientation in KOReader's rotation settings.
+KOReader starts in portrait. The splash screen asks you to **turn the console 90° clockwise**: the power and volume buttons end up on the right, the USB-C port on the left.
+
+**Orientation is fully under your control**, via *Settings → (☰ last tab) → Rotation*:
+- **Auto-rotation (accelerometer):** the screen follows how you hold the console, and you can lock auto-rotation to the current orientation or ignore the accelerometer entirely. ⚠️ Only the **Switch Lite** has a built-in motion sensor; on a regular **Switch/OLED** the sensor is in the Joy-Con, so auto-rotation there needs the Joy-Con attached. Docked, or a bare tablet with no sensor, it simply keeps the orientation you last set.
+- **Manual:** pick any of the four orientations (portrait, landscape, inverted) and it stays there. Works on every model, sensor or not.
 
 | Touch | Action |
 |---|---|
@@ -145,7 +149,7 @@ On macOS the build also needs, from Homebrew: `cmake ninja meson make coreutils 
   - sets up logging and the time zone, and starts the system services;
   - runs `reader.lua` with LuaJIT on a thread with a 32 MB stack. `os.exit` unwinds back to that thread's entry function, so the process always exits from the main thread, which libnx's exit path requires;
   - on exit, closes the whole application (`__nx_applet_exit_mode`) instead of returning to the Homebrew Menu. Restarting goes through the homebrew loader for the NRO, and through `appletRestartProgram` for the installed title.
-- **`base/switch/input.c`** turns the touch screen into multi-touch protocol B events, like a Kobo's, plus applet events (close requested from the HOME menu, docking). It replays HID's touch history, so quick taps between two polls aren't lost. It polls at 120 Hz while the screen is touched and 60 Hz otherwise. Controllers aren't polled.
+- **`base/switch/input.c`** turns the touch screen into multi-touch protocol B events, like a Kobo's, plus applet events (close requested from the HOME menu, docking). It replays HID's touch history, so quick taps between two polls aren't lost, and polls at 120 Hz while the screen is touched and 60 Hz otherwise. It also reads the handheld six-axis sensor and emits KOReader's `EV_MSC`/`MSC_GYRO` rotation events so auto-rotation works; the accelerometer→orientation mapping is a single `GYRO_BASE` constant, easy to adjust per hardware. Controller buttons aren't polled.
 - **`base/switch/device.c`** handles framebuffer presentation, plus battery, backlight, network and auto-sleep. Frames go through libnx's linear shadow buffer, which libnx converts to the GPU's block-linear layout.
 - **`base/ffi/framebuffer_switch.lua`, `base/ffi/input_switch.lua` and `frontend/device/switch/`** are the KOReader backends. The device declares no keys and no D-pad, so the UI behaves like on a touch-only e-reader. Portrait mode uses the framebuffer's `is_always_portrait` rotation, with touch coordinates rotated to match.
 - **LuaJIT** is built interpreter-only, with two more build options:

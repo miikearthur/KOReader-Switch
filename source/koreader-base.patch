@@ -3643,27 +3643,34 @@ index 00000000..a733ddbc
 +#endif
 diff --git a/switch/input.c b/switch/input.c
 new file mode 100644
-index 00000000..77b31656
+index 00000000..af712f86
 --- /dev/null
 +++ b/switch/input.c
-@@ -0,0 +1,214 @@
+@@ -0,0 +1,282 @@
 +/*
 +    KOReader for Nintendo Switch: input.
 +
-+    The port is operated with the touch screen only: no Joy-Con or controller
-+    is needed (or used). This translates libnx touch screen and applet state
-+    into <linux/input.h>-like events, which `ffi/input_switch.lua` hands to the
-+    frontend (multi-touch protocol B, like on Kobo).
++    The port is operated with the touch screen only (no Joy-Con or controller buttons). This
++    translates libnx touch screen state into <linux/input.h>-like multi-touch protocol B events,
++    reports orientation changes from the accelerometer as EV_MSC/MSC_GYRO events (so KOReader's
++    auto-rotation works), and applet state as EV_SDL events. `ffi/input_switch.lua` hands them
++    to the frontend.
++
++    NOTE on the accelerometer: only the Switch Lite has a built-in one. On a regular Switch/OLED
++    the sensor lives in the Joy-Con, so gyro rotation there needs the Joy-Con attached (handheld
++    mode); docked, and undocked-without-Joy-Con, there is no sensor and we simply emit no gyro
++    events (KOReader stays on the manually chosen rotation).
 +*/
 +
 +#include <switch.h>
 +
++#include <math.h>
 +#include <string.h>
 +#include <time.h>
 +
 +#include "koswitch.h"
 +
-+#define MAX_SLOTS 10
++#define MAX_SLOTS        10
 +/* Size of HID's touch screen history (c.f., `hidGetTouchScreenStates`). */
 +#define TOUCH_HISTORY 17
 +/* At most, a sample adds or updates every slot (4 events each), plus SYN_REPORT. */
@@ -3673,6 +3680,15 @@ index 00000000..77b31656
 +#define POLL_ACTIVE_NS   8000000ULL  /* ~120 Hz */
 +#define POLL_IDLE_NS     16666667ULL /* ~60 Hz */
 +#define ACTIVE_LINGER_NS 1000000000ULL
++
++/* Accelerometer: only look every so often, and require the new orientation to hold before committing to it. */
++#define GYRO_SAMPLE_NS   200000000ULL /* 5 Hz is plenty for orientation */
++#define GYRO_SETTLE_NS   500000000ULL
++/*
++    Rotation the device points to (mod 4) is added to the geometric quadrant. If, on real hardware,
++    the screen rotates the wrong way (e.g. by 90° or 180°), change this: 0..3 cycle through the mappings.
++*/
++#define GYRO_BASE 0
 +
 +typedef struct {
 +    bool active;
@@ -3690,11 +3706,18 @@ index 00000000..77b31656
 +
 +static bool g_ready;
 +static bool g_quit_sent;
-+static bool g_touch_synced;
 +static u64 g_touch_sampling_number;
++static bool g_touch_synced;
 +static u64 g_last_touch_ns;
 +static int g_operation_mode = -1;
 +static touch_slot g_slots[MAX_SLOTS];
++
++static HidSixAxisSensorHandle g_sixaxis;
++static bool g_gyro_ready;
++static int g_gyro_rotation = -1;      /* last reported KO_ROTATED_* */
++static int g_gyro_pending = -1;       /* candidate awaiting the settle time */
++static u64 g_gyro_pending_since;
++static u64 g_gyro_next_sample;
 +
 +static u64 timespec_to_ns(const struct timespec *ts)
 +{
@@ -3719,6 +3742,11 @@ index 00000000..77b31656
 +    if (g_ready)
 +        return 0;
 +    hidInitializeTouchScreen();
++    /* The accelerometer is read through the handheld Npad's six-axis sensor. */
++    padConfigureInput(1, HidNpadStyleSet_NpadStandard);
++    if (R_SUCCEEDED(hidGetSixAxisSensorHandles(&g_sixaxis, 1, HidNpadIdType_Handheld, HidNpadStyleTag_NpadHandheld))
++            && R_SUCCEEDED(hidStartSixAxisSensor(g_sixaxis)))
++        g_gyro_ready = true;
 +    g_ready = true;
 +    return 0;
 +}
@@ -3730,6 +3758,45 @@ index 00000000..77b31656
 +            return true;
 +    }
 +    return false;
++}
++
++/* Map the in-plane gravity vector to a KO_ROTATED_* value, or -1 when the console lies too flat to tell. */
++static int accel_to_rotation(float ax, float ay)
++{
++    /* Need a clear tilt (~0.4g in-plane) so a flat console doesn't flip orientation randomly. */
++    if (ax * ax + ay * ay < 0.16f)
++        return -1;
++    /* Quadrant of gravity around the screen, quantized to 0/90/180/270 (M_PI may be absent in newlib). */
++    static const float HALF_PI = 1.57079632679489661923f;
++    float angle = atan2f(ax, -ay);
++    int quadrant = (int)lroundf(angle / HALF_PI);
++    return ((quadrant + GYRO_BASE) % 4 + 4) % 4;
++}
++
++static void poll_gyro(event_queue *q, u64 now)
++{
++    if (!g_gyro_ready || now < g_gyro_next_sample)
++        return;
++    g_gyro_next_sample = now + GYRO_SAMPLE_NS;
++
++    HidSixAxisSensorState state;
++    if (hidGetSixAxisSensorStates(g_sixaxis, &state, 1) == 0 ||
++        !(state.attributes & HidSixAxisSensorAttribute_IsConnected))
++        return;
++
++    int rotation = accel_to_rotation(state.acceleration.x, state.acceleration.y);
++    if (rotation < 0)
++        return;
++    if (rotation != g_gyro_pending) {
++        /* New candidate: wait for it to settle before committing, to ignore brief wobbles. */
++        g_gyro_pending = rotation;
++        g_gyro_pending_since = now;
++        return;
++    }
++    if (rotation != g_gyro_rotation && now - g_gyro_pending_since >= GYRO_SETTLE_NS) {
++        g_gyro_rotation = rotation;
++        emit(q, KO_EV_MSC, KO_MSC_GYRO, rotation);
++    }
 +}
 +
 +/* Turns one touch screen sample into events. Returns true if anything changed. */
@@ -3844,6 +3911,7 @@ index 00000000..77b31656
 +        }
 +
 +        poll_touch(&q, now);
++        poll_gyro(&q, now);
 +        if (q.count > 0)
 +            return q.count;
 +
@@ -4379,10 +4447,10 @@ index 00000000..32f5ca46
 +}
 diff --git a/switch/koswitch.h b/switch/koswitch.h
 new file mode 100644
-index 00000000..ca2e79bc
+index 00000000..fa87350b
 --- /dev/null
 +++ b/switch/koswitch.h
-@@ -0,0 +1,65 @@
+@@ -0,0 +1,73 @@
 +/*
 +    KOReader for Nintendo Switch (libnx homebrew): native glue.
 +
@@ -4398,9 +4466,10 @@ index 00000000..ca2e79bc
 +#define KO_FB_WIDTH  1280
 +#define KO_FB_HEIGHT 720
 +
-+/* Input event types & codes, matching <linux/input.h> (and KOReader's EV_SDL). Touch screen only. */
++/* Input event types & codes, matching <linux/input.h> (and KOReader's EV_SDL). Touch screen + accelerometer. */
 +#define KO_EV_SYN 0
 +#define KO_EV_ABS 3
++#define KO_EV_MSC 4
 +#define KO_EV_SDL 83
 +
 +#define KO_SYN_REPORT         0
@@ -4408,6 +4477,13 @@ index 00000000..ca2e79bc
 +#define KO_ABS_MT_POSITION_X  53
 +#define KO_ABS_MT_POSITION_Y  54
 +#define KO_ABS_MT_TRACKING_ID 57
++
++/* Accelerometer rotation events: EV_MSC / MSC_GYRO, value = KO_ROTATED_* (c.f., KOReader's handleMiscGyroEv). */
++#define KO_MSC_GYRO 71
++#define KO_ROTATED_UPRIGHT           0
++#define KO_ROTATED_CLOCKWISE         1
++#define KO_ROTATED_UPSIDE_DOWN       2
++#define KO_ROTATED_COUNTER_CLOCKWISE 3
 +
 +/* EV_SDL codes. */
 +#define KO_SDL_QUIT           1 /* value: unused */
