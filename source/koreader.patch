@@ -1,5 +1,5 @@
 diff --git a/frontend/device.lua b/frontend/device.lua
-index 6797b27..eb6ee83 100644
+index 6797b27b4..eb6ee838a 100644
 --- a/frontend/device.lua
 +++ b/frontend/device.lua
 @@ -18,6 +18,8 @@ local function probeDevice()
@@ -12,7 +12,7 @@ index 6797b27..eb6ee83 100644
      end
      if util.loadSDL3() then
 diff --git a/frontend/device/generic/device.lua b/frontend/device/generic/device.lua
-index be6c622..23d3236 100644
+index be6c622bd..23d32365b 100644
 --- a/frontend/device/generic/device.lua
 +++ b/frontend/device/generic/device.lua
 @@ -156,6 +156,7 @@ local Device = {
@@ -24,7 +24,7 @@ index be6c622..23d3236 100644
      isEmulator = no,
      isDesktop = no,
 diff --git a/frontend/device/input.lua b/frontend/device/input.lua
-index 33f3652..dcec97b 100644
+index 33f3652d1..dcec97bcb 100644
 --- a/frontend/device/input.lua
 +++ b/frontend/device/input.lua
 @@ -232,6 +232,8 @@ function Input:init()
@@ -38,10 +38,10 @@ index 33f3652..dcec97b 100644
      elseif self.device:isPocketBook() then
 diff --git a/frontend/device/switch/device.lua b/frontend/device/switch/device.lua
 new file mode 100644
-index 0000000..afe9f0b
+index 000000000..58d80cb6a
 --- /dev/null
 +++ b/frontend/device/switch/device.lua
-@@ -0,0 +1,148 @@
+@@ -0,0 +1,189 @@
 +local Event = require("ui/event")
 +local Generic = require("device/generic/device")
 +local ffi = require("ffi")
@@ -139,7 +139,40 @@ index 0000000..afe9f0b
 +    -- Reading involves long stretches without input: don't let the console dim the screen or go to sleep.
 +    C.ko_set_auto_sleep_inhibited(1)
 +
++    -- Faster downloads: LuaSocket reads the network in 2 KiB blocks by default, and on the Switch
++    -- every read is an IPC round-trip to the system network service, so tiny blocks throttle large
++    -- downloads badly (~0.5 MB/s). Big blocks remove that ceiling (measured ~5 MB/s).
++    require("socket").BLOCKSIZE = 256 * 1024
++
 +    Generic.init(self)
++end
++
++-- Keep comic/PDF pages in their original colours in night mode. Night mode inverts the whole screen;
++-- image widgets pre-invert themselves (so book covers look right), but paging documents (CBZ/CBR/PDF/
++-- DjVu) are drawn straight and would come out as negatives. Draw them pre-inverted (Document has an
++-- unused drawPageInverted) so the global inversion cancels out.
++-- NOTE: done here, not in init(): requiring readerview during Device:init() would loop, because
++-- readerview itself requires the (still-loading) device module.
++local function setup_nightmode_original_pages(screen)
++    local ReaderView = require("apps/reader/modules/readerview")
++    local function wrap(method_name)
++        local orig = ReaderView[method_name]
++        if type(orig) ~= "function" then return end
++        ReaderView[method_name] = function(rv, ...)
++            local doc = rv.document
++            if screen.night_mode and doc and doc.drawPageInverted then
++                local had_own = rawget(doc, "drawPage") -- nil when drawPage is a class method
++                doc.drawPage = doc.drawPageInverted     -- draw pre-inverted for this call
++                local ok, err = pcall(orig, rv, ...)
++                doc.drawPage = had_own                  -- restore (nil removes the shadow)
++                if not ok then error(err) end
++            else
++                return orig(rv, ...)
++            end
++        end
++    end
++    wrap("drawSinglePage")   -- single-page view
++    wrap("drawScrollPages")  -- continuous scroll view
 +end
 +
 +function Device:onOperationModeChanged(docked)
@@ -155,6 +188,14 @@ index 0000000..afe9f0b
 +
 +function Device:UIManagerReady(uimgr)
 +    UIManager = uimgr
++    if not self._nightmode_pages_setup then
++        self._nightmode_pages_setup = true
++        -- Defer to the event loop: requiring readerview here (still inside startup module loading)
++        -- would hit a require loop; by the next tick every module has finished loading, and this
++        -- still runs long before the user can open a document.
++        local screen = self.screen
++        UIManager:nextTick(function() setup_nightmode_original_pages(screen) end)
++    end
 +    if C.ko_get_operation_mode() == OPERATION_MODE_DOCKED then
 +        UIManager:nextTick(function() self:onOperationModeChanged(true) end)
 +    end
@@ -192,7 +233,7 @@ index 0000000..afe9f0b
 +return Device
 diff --git a/frontend/device/switch/powerd.lua b/frontend/device/switch/powerd.lua
 new file mode 100644
-index 0000000..8a3ba38
+index 000000000..8a3ba3839
 --- /dev/null
 +++ b/frontend/device/switch/powerd.lua
 @@ -0,0 +1,43 @@
@@ -240,7 +281,7 @@ index 0000000..8a3ba38
 +
 +return SwitchPowerD
 diff --git a/frontend/ui/trapper.lua b/frontend/ui/trapper.lua
-index ee64b46..44d0188 100644
+index ee64b461f..44d0188ea 100644
 --- a/frontend/ui/trapper.lua
 +++ b/frontend/ui/trapper.lua
 @@ -503,6 +503,43 @@ function Trapper:dismissableRunInSubprocess(task, trap_widget_or_string, task_re
@@ -289,7 +330,7 @@ index ee64b46..44d0188 100644
      local own_trap_widget = false
 diff --git a/make/switch.mk b/make/switch.mk
 new file mode 100644
-index 0000000..cb1c01b
+index 000000000..cb1c01b6b
 --- /dev/null
 +++ b/make/switch.mk
 @@ -0,0 +1,84 @@
@@ -609,7 +650,7 @@ HcmV?d00001
 
 diff --git a/platform/switch/koreader.json b/platform/switch/koreader.json
 new file mode 100644
-index 0000000..c46ad67
+index 000000000..c46ad6709
 --- /dev/null
 +++ b/platform/switch/koreader.json
 @@ -0,0 +1,175 @@
@@ -790,7 +831,7 @@ index 0000000..c46ad67
 +}
 diff --git a/platform/switch/nsp_nacp.py b/platform/switch/nsp_nacp.py
 new file mode 100755
-index 0000000..ae4a18c
+index 000000000..ae4a18cb8
 --- /dev/null
 +++ b/platform/switch/nsp_nacp.py
 @@ -0,0 +1,43 @@

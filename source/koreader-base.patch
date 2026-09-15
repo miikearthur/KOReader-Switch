@@ -2948,14 +2948,15 @@ index 00000000..b477bd04
 +}
 diff --git a/switch/device.c b/switch/device.c
 new file mode 100644
-index 00000000..4b77b4af
+index 00000000..465fc009
 --- /dev/null
 +++ b/switch/device.c
-@@ -0,0 +1,139 @@
+@@ -0,0 +1,150 @@
 +/*
 +    KOReader for Nintendo Switch: display & device services.
 +*/
 +
++#include <stdio.h>
 +#include <switch.h>
 +
 +#include <string.h>
@@ -2986,7 +2987,10 @@ index 00000000..4b77b4af
 +void ko_fb_close(void)
 +{
 +    if (g_fb_ready) {
-+        framebufferClose(&g_fb);
++        /* On an OS-initiated close the system reclaims the display; closing the framebuffer
++           ourselves in that state can fault, so leave it to the system when we're being closed. */
++        if (!ko_quit_requested())
++            framebufferClose(&g_fb);
 +        g_fb_ready = false;
 +    }
 +}
@@ -3088,6 +3092,13 @@ index 00000000..4b77b4af
 +
 +void ko_set_auto_sleep_inhibited(int inhibited)
 +{
++    /* During an OS-initiated close (HOME menu) the applet is being torn down by the system;
++       calling back into the applet service here can fault, so skip it — we're exiting anyway. */
++    if (ko_quit_requested()) {
++        fprintf(stderr, "KOReader: teardown: skip auto_sleep (quitting)\n");
++        fflush(NULL);
++        return;
++    }
 +    /* Same as video players: prevents screen dimming & auto-sleep while reading. */
 +    appletSetMediaPlaybackState(inhibited != 0);
 +}
@@ -3701,10 +3712,10 @@ index 00000000..a733ddbc
 +#endif
 diff --git a/switch/input.c b/switch/input.c
 new file mode 100644
-index 00000000..af712f86
+index 00000000..3f96365c
 --- /dev/null
 +++ b/switch/input.c
-@@ -0,0 +1,282 @@
+@@ -0,0 +1,290 @@
 +/*
 +    KOReader for Nintendo Switch: input.
 +
@@ -3764,6 +3775,14 @@ index 00000000..af712f86
 +
 +static bool g_ready;
 +static bool g_quit_sent;
++
++/* True once the OS has asked us to close (e.g. from the HOME menu, where appletMainLoop() returns
++   false). The shutdown path uses this to skip applet/display calls that can fault while the applet
++   is already being torn down by the system. */
++int ko_quit_requested(void)
++{
++    return g_quit_sent ? 1 : 0;
++}
 +static u64 g_touch_sampling_number;
 +static bool g_touch_synced;
 +static u64 g_last_touch_ns;
@@ -4505,10 +4524,10 @@ index 00000000..32f5ca46
 +}
 diff --git a/switch/koswitch.h b/switch/koswitch.h
 new file mode 100644
-index 00000000..fa87350b
+index 00000000..c4fcb5eb
 --- /dev/null
 +++ b/switch/koswitch.h
-@@ -0,0 +1,73 @@
+@@ -0,0 +1,76 @@
 +/*
 +    KOReader for Nintendo Switch (libnx homebrew): native glue.
 +
@@ -4581,13 +4600,16 @@ index 00000000..fa87350b
 +int   ko_is_network_connected(void);
 +void  ko_set_auto_sleep_inhibited(int inhibited);
 +
++/* Non-zero once the OS has requested the app to close (c.f. `input.c`). */
++int   ko_quit_requested(void);
++
 +#endif
 diff --git a/switch/main.c b/switch/main.c
 new file mode 100644
-index 00000000..364658c9
+index 00000000..d909e842
 --- /dev/null
 +++ b/switch/main.c
-@@ -0,0 +1,467 @@
+@@ -0,0 +1,473 @@
 +/*
 +    KOReader for Nintendo Switch: application entry point.
 +
@@ -4874,8 +4896,11 @@ index 00000000..364658c9
 +    }
 +    g_exit_status = status;
 +    /* Like LuaJIT's `os.exit`: close the state (running finalizers) if asked to. */
-+    if (close)
++    if (close) {
++        fprintf(stderr, "KOReader: teardown: closing Lua state\n"); fflush(NULL);
 +        lua_close(L);
++        fprintf(stderr, "KOReader: teardown: Lua state closed\n"); fflush(NULL);
++    }
 +    fflush(NULL);
 +    /*
 +        Don't `exit` from this thread: libnx's exit path switches to the main thread's stack
@@ -5041,11 +5066,14 @@ index 00000000..364658c9
 +        run_koreader(NULL);
 +    pthread_attr_destroy(&attr);
 +
-+    socketExit();
-+    nifmExit();
-+    lblExit();
-+    psmExit();
-+    ko_fb_close();
++    /* Bracket each shutdown step with a flushed log line: if closing from the HOME menu faults,
++       crash.log then shows the last step that started but never finished, pinpointing the culprit. */
++    fprintf(stderr, "KOReader: teardown: thread joined (quit_requested=%d)\n", ko_quit_requested()); fflush(NULL);
++    socketExit();  fprintf(stderr, "KOReader: teardown: socketExit done\n");  fflush(NULL);
++    nifmExit();    fprintf(stderr, "KOReader: teardown: nifmExit done\n");    fflush(NULL);
++    lblExit();     fprintf(stderr, "KOReader: teardown: lblExit done\n");     fflush(NULL);
++    psmExit();     fprintf(stderr, "KOReader: teardown: psmExit done\n");     fflush(NULL);
++    ko_fb_close(); fprintf(stderr, "KOReader: teardown: ko_fb_close done\n"); fflush(NULL);
 +    free(g_screen);
 +    set_exit_mode();
 +    /* Release the exit lock taken at startup, so the process can actually terminate (→ HOME menu). */
