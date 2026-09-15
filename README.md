@@ -1,8 +1,8 @@
 # KOReader for Nintendo Switch
 
 > ⚠️ **This is a completely vibe-coded experiment.** I just wanted to see whether KOReader could run on the
-> Switch, and had it built end-to-end by an AI assistant. It works in the Ryujinx emulator but has **not been
-> tested on real hardware** — treat it as a fun proof of concept, not a polished release. No warranty, no support.
+> Switch, and had it built end-to-end by an AI assistant. It runs on a real Switch and works well — but it's a
+> fun proof of concept, not a polished release. No warranty, no support.
 
 A port of [KOReader](https://github.com/koreader/koreader) to Nintendo Switch homebrew.
 It is built from KOReader `v2026.07.2-161-g945470b` (2026-09-14) and comes in two forms:
@@ -16,18 +16,10 @@ Both contain the same program and use the same data folder, so you can switch be
 
 **Touch screen only:** no Joy-Con or controller is needed, and buttons are ignored. Hold the bare console like a book.
 
-> **Status:** runs in the Ryujinx emulator — it launches, installs itself, renders documents and the UI,
-> loads user-added plugins, and exits cleanly. It has **not been run on real hardware yet**, so treat it as a beta.
-> If something goes wrong, `/switch/koreader/crash.log` on the SD card contains KOReader's log (it's kept across launches).
->
-> **Verified in the Ryujinx emulator:** launch, self-install, document rendering, portrait rotation, touch/menus,
-> the file browser, deleting files, exiting (KOReader closes cleanly), user-added plugins, and networking —
-> DNS plus HTTP and HTTPS both return 200.
->
-> **Not yet confirmed (needs a real console):**
-> - **The SQLite-backed plugins** (statistics, book-cover browser, vocabulary builder, news downloader). Their databases
->   come up empty under Ryujinx's emulated SD card; KOReader skips them and runs normally. Likely fine on a native
->   filesystem, but untested.
+> **Status:** working on a real Switch — it launches, installs itself, renders documents and the UI, handles the
+> file browser and deleting files, loads user-added plugins, auto-rotates, goes online (Wikipedia, OPDS, news,
+> translation), and exits cleanly back to the HOME menu.
+> If something ever goes wrong, `/switch/koreader/crash.log` on the SD card contains KOReader's log (it's kept across launches).
 
 ## Install the NSP (recommended)
 
@@ -147,7 +139,7 @@ On macOS the build also needs, from Homebrew: `cmake ninja meson make coreutils 
   - sets up logging and the time zone, and starts the system services;
   - runs `reader.lua` with LuaJIT on a thread with a 32 MB stack. `os.exit` unwinds back to that thread's entry function, so the process always exits from the main thread, which libnx's exit path requires;
   - on exit, closes the whole application (`__nx_applet_exit_mode`) instead of returning to the Homebrew Menu. Restarting goes through the homebrew loader for the NRO, and through `appletRestartProgram` for the installed title.
-- **`base/switch/input.c`** turns the touch screen into multi-touch protocol B events, like a Kobo's, plus applet events (close requested from the HOME menu, docking). It replays HID's touch history, so quick taps between two polls aren't lost, and polls at 120 Hz while the screen is touched and 60 Hz otherwise. It also reads the handheld six-axis sensor and emits KOReader's `EV_MSC`/`MSC_GYRO` rotation events so auto-rotation works; the accelerometer→orientation mapping is a single `GYRO_BASE` constant, easy to adjust per hardware. Controller buttons aren't polled.
+- **`base/switch/input.c`** turns the touch screen into multi-touch protocol B events, like a Kobo's, plus applet events (close requested from the HOME menu, docking). It replays HID's touch history, so quick taps between two polls aren't lost, and polls at 120 Hz while the screen is touched and 60 Hz otherwise. It also reads the handheld six-axis sensor and emits KOReader's `EV_MSC`/`MSC_GYRO` rotation events so auto-rotation works; the accelerometer→orientation mapping is a single `GYRO_BASE` constant. Controller buttons aren't polled.
 - **`base/switch/device.c`** handles framebuffer presentation, plus battery, backlight, network and auto-sleep. Frames go through libnx's linear shadow buffer, which libnx converts to the GPU's block-linear layout.
 - **`base/ffi/framebuffer_switch.lua`, `base/ffi/input_switch.lua` and `frontend/device/switch/`** are the KOReader backends. The device declares no keys and no D-pad, so the UI behaves like on a touch-only e-reader. It boots in the panel's native landscape orientation; rotation (portrait and the rest) is driven by the accelerometer and the rotation menu, with touch handled by KOReader's standard per-rotation transforms.
 - **LuaJIT** is built interpreter-only, with two more build options:
