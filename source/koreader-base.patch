@@ -1,0 +1,5302 @@
+diff --git a/Makefile b/Makefile
+index 6ea6cdbd..013ad3de 100644
+--- a/Makefile
++++ b/Makefile
+@@ -110,6 +110,53 @@ $(BASE_PREFIX)all $(LEFTOVERS): skeleton $(BUILD_ENTRYPOINT)
+ 
+ # }}}
+ 
++# Nintendo Switch compatibility layer. {{{
++
++ifdef SWITCH
++
++SWITCH_COMPAT_OBJS = $(patsubst $(KOR_BASE)/switch/compat/%.c,$(SWITCH_COMPAT_DIR)/%.o,$(wildcard $(KOR_BASE)/switch/compat/*.c))
++SWITCH_COMPAT_LIB = $(SWITCH_COMPAT_DIR)/libkoswitch.a
++SWITCH_SPECS = $(SWITCH_COMPAT_DIR)/koswitch.specs
++
++# Same as libnx's `switch.specs`, but:
++# - only for executables (so thirdparty projects insisting on building a shared library don't fail),
++# - with our shims & libnx added to the libraries linked by default,
++# - with the POSIX `timezone` & `daylight` globals aliased to newlib's.
++define switch_specs
++%rename link koswitch_link
++
++*link:
++%(koswitch_link) %{!shared:-T $(DEVKITPRO)/libnx/switch.ld -pie --no-dynamic-linker --spare-dynamic-tags=0 --gc-sections -z text -z now -z nodynamic-undefined-weak -z pack-relative-relocs --build-id=sha1 --nx-module-name --defsym=timezone=_timezone --defsym=daylight=_daylight}
++
++*startfile:
++crti%O%s crtbegin%O%s %{!shared:--require-defined=main}
++
++%rename lib koswitch_lib
++
++*lib:
++%{!shared:-lkoswitch -lnx} %(koswitch_lib)
++
++endef
++
++$(SWITCH_COMPAT_DIR)/%.o: $(KOR_BASE)/switch/compat/%.c $(wildcard $(KOR_BASE)/switch/include/*.h $(KOR_BASE)/switch/include/*/*.h) | $(SWITCH_COMPAT_DIR)/
++	$(REALCC) $(CFLAGS) -Wall -c $< -o $@
++
++$(SWITCH_COMPAT_LIB): $(SWITCH_COMPAT_OBJS)
++	rm -f $@
++	$(AR) rcs $@ $^
++
++$(SWITCH_SPECS): $(KOR_BASE)/Makefile | $(SWITCH_COMPAT_DIR)/
++	$(call write_file,$@,$(switch_specs))
++
++$(BUILD_ENTRYPOINT): | $(SWITCH_COMPAT_LIB) $(SWITCH_SPECS)
++$(BASE_PREFIX)all $(LEFTOVERS): $(SWITCH_COMPAT_LIB) $(SWITCH_SPECS)
++
++SOUND += $(SWITCH_COMPAT_DIR)/%
++
++endif
++
++# }}}
++
+ # Output skeleton. {{{
+ 
+ CR3GUI_DATADIR = $(THIRDPARTY_DIR)/kpvcrlib/crengine/cr3gui/data
+diff --git a/Makefile.defs b/Makefile.defs
+index 6c122f3b..d9adad64 100644
+--- a/Makefile.defs
++++ b/Makefile.defs
+@@ -251,6 +251,13 @@ else ifeq ($(TARGET), cervantes)
+ 		CHOST?=arm-linux-gnueabi
+ 	endif
+ 	USE_LJ_WPACLIENT=1
++else ifeq ($(TARGET), switch)
++	# Nintendo Switch homebrew (devkitA64 + libnx).
++	SWITCH=1
++	CHOST?=aarch64-none-elf
++	MONOLIBTIC=1
++	export DEVKITPRO ?= /opt/devkitpro
++	export PATH:=$(DEVKITPRO)/devkitA64/bin:$(DEVKITPRO)/tools/bin:$(PATH)
+ else ifndef TARGET
+ 	# if TARGET is not defined we will build an emulator on current machine
+ 	EMULATE_READER=1
+@@ -280,7 +287,7 @@ endif
+ #       Ensuring Lua/C modules have their own DT_NEEDED entry to the shared LuaJIT library works around this quirk (and is otherwise mostly harmless).
+ #       Saner APIs behave like Linux, and wouldn't require this hack.
+ USE_LUAJIT_LIB = $(or $(DARWIN),$(ANDROID),$(WIN32))
+-SKIP_LUAJIT_BIN = $(ANDROID)
++SKIP_LUAJIT_BIN = $(or $(ANDROID),$(SWITCH))
+ 
+ RCP := cp -R
+ WGET ?= wget --no-verbose --progress=dot:giga --show-progress
+@@ -575,6 +582,10 @@ else ifeq ($(TARGET), remarkable)
+ 	TARGET_CFLAGS+=-mfloat-abi=hard
+ else ifeq ($(TARGET), remarkable-aarch64)
+ 	TARGET_CFLAGS:=$(ARM64_A53_ARCH)
++else ifeq ($(TARGET), switch)
++	# Same as libnx's own build: the software thread pointer (`-mtp=soft`) breaks the TLS descriptors used by
++	# default for thread-local variables in PIC code (they'd resolve to garbage), so force the local-exec model.
++	TARGET_CFLAGS:=-march=armv8-a+crc+crypto -mtune=cortex-a57 -mtp=soft -ftls-model=local-exec -D__SWITCH__ -isystem $(abspath $(KOR_BASE)/switch/include) -isystem $(DEVKITPRO)/libnx/include
+ else ifeq ($(TARGET), sony-prstux)
+ 	TARGET_CFLAGS:=$(ARMV7_A8_ARCH)
+ 	TARGET_CFLAGS+=-mfloat-abi=hard
+@@ -639,7 +650,12 @@ CFLAGS:=$(BASE_CFLAGS) $(QFLAGS) $(CSTD_FLAGS)
+ CXXFLAGS:=$(BASE_CFLAGS) $(QFLAGS) $(CXXSTD_FLAGS)
+ HOSTCFLAGS:=$(BASE_CFLAGS) $(QFLAGS)
+ 
+-ifndef DARWIN
++ifdef SWITCH
++  # Everything ends up statically linked into a single executable (NRO).
++  # NOTE: the specs file is added below (once `OUTPUT_DIR` is known).
++  # NOTE: `-fPIC` is required at link time too, to select the PIC multilib (like libnx's `switch_rules`).
++  LDFLAGS := $(filter -m%,$(TARGET_CFLAGS)) -fPIC -L$(DEVKITPRO)/libnx/lib -L$(abspath $(KOR_BASE)/switch/stubs) -Wl,-O1,--gc-sections,-z,noexecstack
++else ifndef DARWIN
+   LDFLAGS := -Wl,-O1,--as-needed,--gc-sections $(COMPAT_LDFLAGS)
+   # To prefer our shipped libraries over the system's,
+   # we set a couple rpath via an include file to make sure it goes through buildsystem indirection unscathed...
+@@ -682,6 +698,13 @@ endif
+ OUTPUT_DIR ?= $(KOR_BASE)/build/$(MACHINE)
+ CMAKE_DIR = $(OUTPUT_DIR)/cmake
+ STAGING_DIR = $(OUTPUT_DIR)/staging
++
++ifdef SWITCH
++  # Our compatibility shims (`libkoswitch`) & libnx are added to every link through a specs
++  # file wrapping libnx's own (c.f., `Makefile`), so configure checks match the final link.
++  SWITCH_COMPAT_DIR = $(OUTPUT_DIR)/switch
++  LDFLAGS += -specs=$(abspath $(SWITCH_COMPAT_DIR))/koswitch.specs -L$(abspath $(SWITCH_COMPAT_DIR))
++endif
+ SPEC_ROCKS_DIR = $(OUTPUT_DIR)/spec/rocks
+ 
+ BUILD_ENTRYPOINT = $(CMAKE_DIR)/build.ninja
+@@ -737,7 +760,7 @@ ifneq ($(TARGET), win32)
+ endif
+ 
+ # Improve reproducibility.
+-ifndef DARWIN
++ifeq (,$(DARWIN)$(SWITCH))
+ LDFLAGS += -Wl,--build-id=none
+ endif
+ 
+@@ -998,6 +1021,8 @@ set(LEGACY         $(LEGACY))
+ set(POCKETBOOK     $(POCKETBOOK))
+ set(REMARKABLE     $(REMARKABLE))
+ set(SONY_PRSTUX    $(SONY_PRSTUX))
++set(SWITCH         $(SWITCH))
++set(DEVKITPRO      $(DEVKITPRO))
+ 
+ set(SKIP_LUAJIT_BIN $(SKIP_LUAJIT_BIN))
+ set(USE_LUAJIT_LIB  $(USE_LUAJIT_LIB))
+@@ -1087,7 +1112,7 @@ c = [CCACHE, '$(strip $(HOSTCC))']
+ # c_ld
+ cpp = [CCACHE, '$(strip $(HOSTCXX))']
+ # cpp_ld
+-ar = '$(strip $(HOSTSTRIP))'
++ar = '$(strip $(HOSTAR))'
+ ranlib = '$(strip $(HOSTRANLIB))'
+ strip = 'true'
+ 
+diff --git a/cmake/CMakeLists.txt b/cmake/CMakeLists.txt
+index 0f555f07..70345434 100644
+--- a/cmake/CMakeLists.txt
++++ b/cmake/CMakeLists.txt
+@@ -172,7 +172,7 @@ check_libc_fn_exists(ngettext libintl.h HAS_GETTEXT)
+ # We don't want to rely on `-static-libstdc++`, as it risks breaking the ODR. (Also, it was a pain to deal with because
+ # of libtool, c.f., https://www.gnu.org/software/libtool/manual/html_node/Stripped-link-flags.html#Stripped-link-flags).
+ #
+-if(NOT ((ANDROID AND MONOLIBTIC) OR APPLE OR EMULATE_READER OR USE_SDL))
++if(NOT ((ANDROID AND MONOLIBTIC) OR APPLE OR EMULATE_READER OR SWITCH OR USE_SDL))
+     set(STL_INSTALL_CMD)
+     if(ANDROID)
+         set(STL_NAME libc++_shared.so)
+@@ -241,7 +241,7 @@ set(crengine_BINARY_DIR ${crengine_CMAKE_BINARY_DIR}/build)
+ declare_project(thirdparty/cpu_features EXCLUDE_FROM_ALL)
+ 
+ # czmq
+-if(NOT WIN32)
++if(NOT (WIN32 OR SWITCH))
+     set(EXCLUDE_FROM_ALL)
+ else()
+     set(EXCLUDE_FROM_ALL EXCLUDE_FROM_ALL)
+@@ -353,7 +353,7 @@ declare_project(thirdparty/libunibreak EXCLUDE_FROM_ALL)
+ declare_project(thirdparty/libwebp)
+ 
+ # libzmq
+-if(NOT WIN32)
++if(NOT (WIN32 OR SWITCH))
+     set(EXCLUDE_FROM_ALL)
+ else()
+     set(EXCLUDE_FROM_ALL EXCLUDE_FROM_ALL)
+@@ -442,7 +442,13 @@ declare_project(thirdparty/popen-noshell EXCLUDE_FROM_ALL)
+ declare_project(thirdparty/proxy-libintl EXCLUDE_FROM_ALL)
+ 
+ # sdcv
+-declare_project(thirdparty/sdcv DEPENDS glib zlib)
++if(SWITCH)
++    # No way to spawn external programs on Horizon.
++    set(EXCLUDE_FROM_ALL EXCLUDE_FROM_ALL)
++else()
++    set(EXCLUDE_FROM_ALL)
++endif()
++declare_project(thirdparty/sdcv DEPENDS glib zlib ${EXCLUDE_FROM_ALL})
+ 
+ # sdl3
+ if(USE_SDL STREQUAL "builtin")
+@@ -757,6 +763,7 @@ set(VERSIONS
+     android_arm android_arm64 android_x86 android_x64
+     linux_arm linux_arm64 linux_x64
+     macos
++    switch_arm64
+ )
+ add_custom_target(
+     posix-ffi
+@@ -780,6 +787,8 @@ if(ANDROID)
+     set(POSIX_PLATFORM android_${LUAJIT_ARCH})
+ elseif(APPLE)
+     set(POSIX_PLATFORM macos)
++elseif(SWITCH)
++    set(POSIX_PLATFORM switch_${LUAJIT_ARCH})
+ else()
+     set(POSIX_PLATFORM linux_${LUAJIT_ARCH})
+ endif()
+diff --git a/ffi-cdecl/posix_cdecl.c b/ffi-cdecl/posix_cdecl.c
+index 753706ac..5b9307e4 100644
+--- a/ffi-cdecl/posix_cdecl.c
++++ b/ffi-cdecl/posix_cdecl.c
+@@ -9,6 +9,9 @@
+ # define __posix_basename  basename
+ #elif defined(__APPLE__)
+ # define __asm(...)
++#elif defined(__SWITCH__)
++// `basename(…)` is a macro for `__xpg_basename(…)`.
++# define __xpg_basename  basename
+ #elif defined(__linux__)
+ # define _BSD_SOURCE
+ # define _DEFAULT_SOURCE
+@@ -29,15 +32,19 @@
+ #include <sys/statvfs.h>
+ #include <sys/time.h>
+ #include <sys/types.h>
+-#include <sys/un.h>
++#if !defined(__SWITCH__)
++# include <sys/un.h>
++#endif
+ #include <sys/wait.h>
+ 
+ #include <arpa/inet.h>
+ #include <errno.h>
+ #include <fcntl.h>
+-#include <ifaddrs.h>
++#if !defined(__SWITCH__)
++# include <ifaddrs.h>
++#endif
+ #include <limits.h>
+-#if !defined(__ANDROID__) && !defined(__APPLE__)
++#if !defined(__ANDROID__) && !defined(__APPLE__) && !defined(__SWITCH__)
+ # include <mqueue.h>
+ #endif
+ #include <net/if.h>
+@@ -47,8 +54,10 @@
+ #endif
+ #include <net/route.h>
+ #include <netdb.h>
+-#include <netinet/ip.h>
+-#include <netinet/ip_icmp.h>
++#if !defined(__SWITCH__)
++# include <netinet/ip.h>
++# include <netinet/ip_icmp.h>
++#endif
+ #if defined(__linux__)
+ # include <netpacket/packet.h>
+ #endif
+@@ -104,6 +113,26 @@ cdecl_type_replace(u_long, unsigned long);
+ cdecl_type_replace(u_int8_t, uint8_t);
+ cdecl_type_replace(u_int16_t, uint16_t);
+ cdecl_type_replace(u_int32_t, uint32_t);
++#elif defined(__SWITCH__)
++cdecl_type_replace(__int8_t, int8_t);
++cdecl_type_replace(__int16_t, int16_t);
++cdecl_type_replace(__int32_t, int32_t);
++cdecl_type_replace(__int64_t, int64_t);
++cdecl_type_replace(__uint8_t, uint8_t);
++cdecl_type_replace(__uint16_t, uint16_t);
++cdecl_type_replace(__uint32_t, uint32_t);
++cdecl_type_replace(__uint64_t, uint64_t);
++cdecl_type_replace(__int_least64_t, int64_t);
++cdecl_type_replace(_off_t, int64_t);
++cdecl_type_replace(_ssize_t, ssize_t);
++cdecl_type_replace(u_char, unsigned char);
++cdecl_type_replace(u_short, unsigned short);
++cdecl_type_replace(u_int, unsigned);
++cdecl_type_replace(u_long, unsigned long);
++cdecl_type_replace(u_int8_t, uint8_t);
++cdecl_type_replace(u_int16_t, uint16_t);
++cdecl_type_replace(u_int32_t, uint32_t);
++cdecl_type_replace(u_int64_t, uint64_t);
+ #elif defined(__linux__)
+ cdecl_type_replace(__s8, int8_t);
+ cdecl_type_replace(__s16, int16_t);
+@@ -173,6 +202,14 @@ cdecl_const(PATH_MAX);
+ # if !defined(CLOCK_BOOTTIME)
+ #  define CLOCK_BOOTTIME  7
+ # endif
++#elif defined(__SWITCH__)
++# define CLOCK_BOOTTIME          -1 // not available
++# if !defined(CLOCK_MONOTONIC_COARSE)
++#  define CLOCK_MONOTONIC_COARSE  CLOCK_MONOTONIC
++# endif
++# if !defined(CLOCK_REALTIME_COARSE)
++#  define CLOCK_REALTIME_COARSE   CLOCK_REALTIME
++# endif
+ #endif
+ 
+ cdecl_const(CLOCK_BOOTTIME);
+@@ -188,7 +225,7 @@ cdecl_type(__kernel_clockid_t);
+ // On macOS, `clockid_t` is an enum.
+ _Static_assert(__builtin_types_compatible_p(unsigned, clockid_t), "unsigned != clockid_t");
+ cdecl_out(type_clockid_t, typedef unsigned clockid_t;);
+-#elif defined(__linux__)
++#elif defined(__linux__) || defined(__SWITCH__)
+ cdecl_type_replace(__clockid_t, clockid_t);
+ cdecl_type(__clockid_t);
+ #endif
+@@ -212,7 +249,7 @@ cdecl_type_replace(__darwin_useconds_t, useconds_t);
+ cdecl_type(__darwin_suseconds_t);
+ cdecl_type(__darwin_time_t);
+ cdecl_type(__darwin_useconds_t);
+-#elif defined(__linux__)
++#elif defined(__linux__) || defined(__SWITCH__)
+ cdecl_type_replace(__suseconds_t, suseconds_t);
+ cdecl_type_replace(__time_t, time_t);
+ cdecl_type_replace(__useconds_t, useconds_t);
+@@ -268,7 +305,7 @@ cdecl_type(nlink_t);
+ cdecl_type(__darwin_off_t);
+ cdecl_type(__darwin_pid_t);
+ cdecl_type(__darwin_uid_t);
+-#elif defined(__linux__)
++#elif defined(__linux__) || defined(__SWITCH__)
+ cdecl_type_replace(__blkcnt_t, blkcnt_t);
+ cdecl_type_replace(__blksize_t, blksize_t);
+ cdecl_type_replace(__dev_t, dev_t);
+@@ -301,7 +338,7 @@ cdecl_type_replace(__darwin_fsblkcnt_t, fsblkcnt_t);
+ cdecl_type_replace(__darwin_fsfilcnt_t, fsfilcnt_t);
+ cdecl_type(__darwin_fsblkcnt_t);
+ cdecl_type(__darwin_fsfilcnt_t);
+-#elif defined(__linux__)
++#elif defined(__linux__) || defined(__SWITCH__)
+ cdecl_type_replace(__fsblkcnt_t, fsblkcnt_t);
+ cdecl_type_replace(__fsfilcnt_t, fsfilcnt_t);
+ cdecl_type(__fsblkcnt_t);
+@@ -338,7 +375,7 @@ cdecl_const(SOCK_RAW);
+ cdecl_const(SOCK_SEQPACKET);
+ 
+ #if defined(__ANDROID__)
+-#elif defined(__APPLE__)
++#elif defined(__APPLE__) || defined(__SWITCH__)
+ cdecl_type(caddr_t);
+ #elif defined(__linux__)
+ cdecl_type_replace(__caddr_t, caddr_t);
+@@ -351,6 +388,9 @@ cdecl_type(in_port_t);
+ #if defined(__ANDROID__)
+ cdecl_type_replace(__kernel_sa_family_t, sa_family_t);
+ cdecl_type(__kernel_sa_family_t);
++#elif defined(__SWITCH__)
++cdecl_type_replace(__sa_family_t, sa_family_t);
++cdecl_type(__sa_family_t);
+ #elif defined(__APPLE__)
+ cdecl_type(sa_family_t);
+ #elif defined(__linux__)
+@@ -360,7 +400,7 @@ cdecl_type(sa_family_t);
+ #if defined(__APPLE__)
+ cdecl_type_replace(__darwin_socklen_t, socklen_t);
+ cdecl_type(__darwin_socklen_t);
+-#elif defined(__linux__)
++#elif defined(__linux__) || defined(__SWITCH__)
+ cdecl_type_replace(__socklen_t, socklen_t);
+ cdecl_type(__socklen_t);
+ #endif
+@@ -380,7 +420,7 @@ cdecl_struct(sockaddr_un);
+ cdecl_struct(sockaddr_storage);
+ 
+ cdecl_struct(ifaddrs);
+-#if !defined(__ANDROID__)
++#if !defined(__ANDROID__) && !defined(__SWITCH__)
+ # if defined(__APPLE__)
+ cdecl_struct(ifdevmtu);
+ cdecl_struct(ifkpi);
+@@ -420,7 +460,11 @@ cdecl_func(mq_receive);
+ 
+ cdecl_const(PTHREAD_CREATE_DETACHED);
+ 
+-#if defined(__ANDROID__)
++#if defined(__SWITCH__)
++// Used by `pthread_attr_t`.
++cdecl_struct(sched_param);
++#endif
++#if defined(__ANDROID__) || defined(__SWITCH__)
+ cdecl_type(pthread_attr_t);
+ cdecl_type(pthread_t);
+ #elif defined(__APPLE__)
+@@ -624,6 +668,10 @@ cdecl_func(gmtime_r);
+ cdecl_func(localtime);
+ cdecl_func(strftime);
+ cdecl_func(time);
++#if defined(__SWITCH__)
++// Not declared by newlib (provided by `switch/compat/timegm.c`).
++time_t timegm(struct tm *);
++#endif
+ cdecl_func(timegm);
+ 
+ cdecl_struct(timezone);
+@@ -634,6 +682,13 @@ cdecl_type_replace(__timezone_ptr_t, struct timezone *);
+ cdecl_func(gettimeofday);
+ cdecl_func(settimeofday);
+ 
++#if defined(__SWITCH__)
++// Not available (and unused, since there are no subprocesses).
++# define PRIO_PROCESS  0
++# define PRIO_PGRP     1
++# define PRIO_USER     2
++#endif
++
+ cdecl_const(PRIO_PROCESS);
+ cdecl_const(PRIO_PGRP);
+ cdecl_const(PRIO_USER);
+@@ -675,6 +730,13 @@ cdecl_func(getifaddrs);
+ 
+ cdecl_func(ioctl);
+ 
++#if defined(__SWITCH__)
++// <netinet/ip_icmp.h> is not available.
++# define ICMP_ECHO       8
++# define ICMP_ECHOREPLY  0
++# define ICMP_MINLEN     8
++#endif
++
+ cdecl_const(ICMP_ECHO);
+ cdecl_const(ICMP_ECHOREPLY);
+ cdecl_const(ICMP_MINLEN);
+diff --git a/ffi-cdecl/posix_h_switch_arm64.lua b/ffi-cdecl/posix_h_switch_arm64.lua
+new file mode 100644
+index 00000000..8790f894
+--- /dev/null
++++ b/ffi-cdecl/posix_h_switch_arm64.lua
+@@ -0,0 +1,529 @@
++-- Automatically generated with ffi-cdecl.
++
++require("ffi").cdef[[
++// cdecl_const_EAGAIN
++static const unsigned EAGAIN = 11;
++// cdecl_const_EINTR
++static const unsigned EINTR = 4;
++// cdecl_const_EINVAL
++static const unsigned EINVAL = 22;
++// cdecl_const_ENODEV
++static const unsigned ENODEV = 19;
++// cdecl_const_ENOSYS
++static const unsigned ENOSYS = 88;
++// cdecl_const_EPERM
++static const unsigned EPERM = 1;
++// cdecl_const_EPIPE
++static const unsigned EPIPE = 32;
++// cdecl_const_ETIME
++static const unsigned ETIME = 62;
++// cdecl_const_ETIMEDOUT
++static const unsigned ETIMEDOUT = 116;
++// cdecl_const_O_APPEND
++static const unsigned O_APPEND = 8;
++// cdecl_const_O_CLOEXEC
++static const unsigned O_CLOEXEC = 262144;
++// cdecl_const_O_CREAT
++static const unsigned O_CREAT = 512;
++// cdecl_const_O_NONBLOCK
++static const unsigned O_NONBLOCK = 16384;
++// cdecl_const_O_RDONLY
++static const unsigned O_RDONLY = 0;
++// cdecl_const_O_RDWR
++static const unsigned O_RDWR = 2;
++// cdecl_const_O_TRUNC
++static const unsigned O_TRUNC = 1024;
++// cdecl_const_O_WRONLY
++static const unsigned O_WRONLY = 1;
++// cdecl_const_F_OK
++static const unsigned F_OK = 0;
++// cdecl_const_R_OK
++static const unsigned R_OK = 4;
++// cdecl_const_W_OK
++static const unsigned W_OK = 2;
++// cdecl_const_X_OK
++static const unsigned X_OK = 1;
++// cdecl_const_S_IRGRP
++static const unsigned S_IRGRP = 32;
++// cdecl_const_S_IROTH
++static const unsigned S_IROTH = 4;
++// cdecl_const_S_IRUSR
++static const unsigned S_IRUSR = 256;
++// cdecl_const_S_IRWXG
++static const unsigned S_IRWXG = 56;
++// cdecl_const_S_IRWXO
++static const unsigned S_IRWXO = 7;
++// cdecl_const_S_IRWXU
++static const unsigned S_IRWXU = 448;
++// cdecl_const_S_IWGRP
++static const unsigned S_IWGRP = 16;
++// cdecl_const_S_IWOTH
++static const unsigned S_IWOTH = 2;
++// cdecl_const_S_IWUSR
++static const unsigned S_IWUSR = 128;
++// cdecl_const_S_IXGRP
++static const unsigned S_IXGRP = 8;
++// cdecl_const_S_IXOTH
++static const unsigned S_IXOTH = 1;
++// cdecl_const_S_IXUSR
++static const unsigned S_IXUSR = 64;
++// cdecl_const_SEEK_CUR
++static const unsigned SEEK_CUR = 1;
++// cdecl_const_SEEK_END
++static const unsigned SEEK_END = 2;
++// cdecl_const_SEEK_SET
++static const unsigned SEEK_SET = 0;
++// cdecl_const_PATH_MAX
++static const unsigned PATH_MAX = 1024;
++// cdecl_const_CLOCK_BOOTTIME
++static const int CLOCK_BOOTTIME = -1;
++// cdecl_const_CLOCK_MONOTONIC
++static const unsigned CLOCK_MONOTONIC = 4;
++// cdecl_const_CLOCK_MONOTONIC_COARSE
++static const unsigned CLOCK_MONOTONIC_COARSE = 4;
++// cdecl_const_CLOCK_REALTIME
++static const unsigned CLOCK_REALTIME = 1;
++// cdecl_const_CLOCK_REALTIME_COARSE
++static const unsigned CLOCK_REALTIME_COARSE = 1;
++// cdecl_type_clockid_t
++typedef unsigned long clockid_t;
++// cdecl_const_FIONREAD
++static const unsigned FIONREAD = 1074030207;
++// cdecl_type_suseconds_t
++typedef long suseconds_t;
++// cdecl_type_time_t
++typedef long time_t;
++// cdecl_type_useconds_t
++typedef unsigned long useconds_t;
++// cdecl_struct_timeval
++struct timeval {
++  time_t tv_sec;
++  suseconds_t tv_usec;
++};
++// cdecl_struct_timespec
++struct timespec {
++  time_t tv_sec;
++  long tv_nsec;
++};
++// cdecl_type_blkcnt_t
++typedef long blkcnt_t;
++// cdecl_type_blksize_t
++typedef long blksize_t;
++// cdecl_type_dev_t
++typedef short dev_t;
++// cdecl_type_gid_t
++typedef unsigned short gid_t;
++// cdecl_type_id_t
++typedef uint32_t id_t;
++// cdecl_type_ino_t
++typedef unsigned short ino_t;
++// cdecl_type_mode_t
++typedef uint32_t mode_t;
++// cdecl_type_nlink_t
++typedef unsigned short nlink_t;
++// cdecl_type_off_t
++typedef int64_t off_t;
++// cdecl_type_pid_t
++typedef int pid_t;
++// cdecl_type_uid_t
++typedef unsigned short uid_t;
++// cdecl_type_fsblkcnt_t
++typedef uint64_t fsblkcnt_t;
++// cdecl_type_fsfilcnt_t
++typedef uint32_t fsfilcnt_t;
++// cdecl_struct_statvfs
++struct statvfs {
++  unsigned long f_bsize;
++  unsigned long f_frsize;
++  fsblkcnt_t f_blocks;
++  fsblkcnt_t f_bfree;
++  fsblkcnt_t f_bavail;
++  fsfilcnt_t f_files;
++  fsfilcnt_t f_ffree;
++  fsfilcnt_t f_favail;
++  unsigned long f_fsid;
++  unsigned long f_flag;
++  unsigned long f_namemax;
++};
++// cdecl_const_AF_INET
++static const unsigned AF_INET = 2;
++// cdecl_const_AF_INET6
++static const unsigned AF_INET6 = 28;
++// cdecl_const_AF_UNIX
++static const unsigned AF_UNIX = 1;
++// cdecl_const_NI_MAXHOST
++static const unsigned NI_MAXHOST = 1025;
++// cdecl_const_NI_NUMERICHOST
++static const unsigned NI_NUMERICHOST = 2;
++// cdecl_const_SOCK_CLOEXEC
++static const unsigned SOCK_CLOEXEC = 268435456;
++// cdecl_const_SOCK_DGRAM
++static const unsigned SOCK_DGRAM = 2;
++// cdecl_const_SOCK_NONBLOCK
++static const unsigned SOCK_NONBLOCK = 536870912;
++// cdecl_const_SOCK_RAW
++static const unsigned SOCK_RAW = 3;
++// cdecl_const_SOCK_SEQPACKET
++static const unsigned SOCK_SEQPACKET = 5;
++// cdecl_type_caddr_t
++typedef char *caddr_t;
++// cdecl_type_in_addr_t
++typedef uint32_t in_addr_t;
++// cdecl_type_in_port_t
++typedef uint16_t in_port_t;
++// cdecl_type_sa_family_t
++typedef uint8_t sa_family_t;
++// cdecl_type_socklen_t
++typedef uint32_t socklen_t;
++// cdecl_struct_in_addr
++struct in_addr {
++  in_addr_t s_addr;
++};
++// cdecl_struct_in6_addr
++struct in6_addr {
++  union {
++    uint16_t __u6_addr16[8];
++    uint32_t __u6_addr32[4];
++    unsigned char s6_addr[16];
++  };
++};
++// cdecl_struct_sockaddr
++struct sockaddr {
++  unsigned char sa_len;
++  sa_family_t sa_family;
++  char sa_data[14];
++};
++// cdecl_struct_sockaddr_in
++struct sockaddr_in {
++  uint8_t sin_len;
++  sa_family_t sin_family;
++  in_port_t sin_port;
++  struct in_addr sin_addr;
++  char sin_zero[8];
++};
++// cdecl_struct_sockaddr_in6
++struct sockaddr_in6 {
++  sa_family_t sin6_family;
++  in_port_t sin6_port;
++  uint32_t sin6_flowinfo;
++  struct in6_addr sin6_addr;
++  uint32_t sin6_scope_id;
++};
++// cdecl_struct_sockaddr_storage
++struct sockaddr_storage {
++  unsigned char ss_len;
++  sa_family_t ss_family;
++  char __ss_pad1[((sizeof (int64_t)) - sizeof (unsigned char) - sizeof (sa_family_t))];
++  int64_t __ss_align;
++  char __ss_pad2[(128U - sizeof (unsigned char) - sizeof (sa_family_t) - ((sizeof (int64_t)) - sizeof (unsigned char) - sizeof (sa_family_t)) - (sizeof (int64_t)))];
++};
++// cdecl_type_nfds_t
++typedef unsigned nfds_t;
++// cdecl_const_PTHREAD_CREATE_DETACHED
++static const unsigned PTHREAD_CREATE_DETACHED = 0;
++// cdecl_struct_sched_param
++struct sched_param {
++  int sched_priority;
++};
++// cdecl_type_pthread_attr_t
++// NOTE: `schedparam` is `struct sched_param` (a single `int sched_priority`), inlined
++// so the merged `ffi/posix_h.lua` doesn't forward-reference a not-yet-declared struct
++// (only this platform's pthread_attr_t embeds it by value). It's parse-only on Switch:
++// the pthread FFI is never used (no subprocesses), the launcher uses the C pthread API.
++typedef struct {
++  void *stackaddr;
++  int stacksize;
++  struct { int sched_priority; } schedparam;
++  int detachstate;
++} pthread_attr_t;
++// cdecl_type_pthread_t
++typedef struct __pthread_t *pthread_t;
++// cdecl_func_pthread_attr_destroy
++int pthread_attr_destroy(pthread_attr_t *);
++// cdecl_func_pthread_attr_init
++int pthread_attr_init(pthread_attr_t *);
++// cdecl_func_pthread_attr_setdetachstate
++int pthread_attr_setdetachstate(pthread_attr_t *, int);
++// cdecl_func_pthread_create
++int pthread_create(pthread_t *, const pthread_attr_t *, void *(*)(void *), void *);
++// cdecl_const_POLLERR
++static const unsigned POLLERR = 8;
++// cdecl_const_POLLHUP
++static const unsigned POLLHUP = 16;
++// cdecl_const_POLLIN
++static const unsigned POLLIN = 1;
++// cdecl_const_POLLOUT
++static const unsigned POLLOUT = 4;
++// cdecl_struct_pollfd
++struct pollfd {
++  int fd;
++  short events;
++  short revents;
++};
++// cdecl_func_poll
++int poll(struct pollfd *, nfds_t, int);
++// cdecl_func_calloc
++void *calloc(size_t, size_t);
++// cdecl_func_free
++void free(void *);
++// cdecl_func_malloc
++void *malloc(size_t);
++// cdecl_func_mkdtemp
++char *mkdtemp(char *);
++// cdecl_func_mkstemps
++int mkstemps(char *, int);
++// cdecl_func_realloc
++void *realloc(void *, size_t);
++// cdecl_func_realpath
++char *realpath(const char *, char *);
++// cdecl_func_setenv
++int setenv(const char *, const char *, int);
++// cdecl_func_unsetenv
++int unsetenv(const char *);
++// cdecl_func_basename
++char *basename(char *)__asm__("""basename");
++// cdecl_func_dirname
++char *dirname(char *);
++// cdecl_const_F_SETFD
++static const unsigned F_SETFD = 2;
++// cdecl_const_F_GETFL
++static const unsigned F_GETFL = 3;
++// cdecl_const_F_SETFL
++static const unsigned F_SETFL = 4;
++// cdecl_const_FD_CLOEXEC
++static const unsigned FD_CLOEXEC = 1;
++// cdecl_func_fcntl
++int fcntl(int, int, ...);
++// cdecl_func_open
++int open(const char *, int, ...);
++// cdecl_const_HAVE_POSIX_FALLOCATE
++static const unsigned HAVE_POSIX_FALLOCATE = 0;
++// cdecl_type_FILE
++typedef struct _IO_FILE FILE;
++// cdecl_func_fclose
++int fclose(FILE *);
++// cdecl_func_ferror
++int ferror(FILE *);
++// cdecl_func_fflush
++int fflush(FILE *);
++// cdecl_func_fileno
++int fileno(FILE *);
++// cdecl_func_fopen
++FILE *fopen(const char *, const char *);
++// cdecl_func_fputs
++int fputs(const char *, FILE *);
++// cdecl_func_fread
++size_t fread(void *, size_t, size_t, FILE *);
++// cdecl_func_fwrite
++size_t fwrite(const void *, size_t, size_t, FILE *);
++// cdecl_func_sprintf
++int sprintf(char *, const char *, ...);
++// cdecl_func__exit
++void _exit(int);
++// cdecl_func_access
++int access(const char *, int);
++// cdecl_func_close
++int close(int);
++// cdecl_func_dup2
++int dup2(int, int);
++// cdecl_func_execl
++int execl(const char *, const char *, ...);
++// cdecl_func_execlp
++int execlp(const char *, const char *, ...);
++// cdecl_func_execvp
++int execvp(const char *, char *const[]);
++// cdecl_func_fdatasync
++int fdatasync(int);
++// cdecl_func_fork
++pid_t fork(void);
++// cdecl_func_fsync
++int fsync(int);
++// cdecl_func_ftruncate
++int ftruncate(int, off_t);
++// cdecl_func_getpid
++pid_t getpid(void);
++// cdecl_func_getppid
++pid_t getppid(void);
++// cdecl_func_getuid
++uid_t getuid(void);
++// cdecl_func_lseek
++off_t lseek(int, off_t, int);
++// cdecl_func_pause
++int pause(void);
++// cdecl_func_pipe
++int pipe(int[2]);
++// cdecl_func_read
++ssize_t read(int, void *, size_t);
++// cdecl_func_setpgid
++int setpgid(pid_t, pid_t);
++// cdecl_func_setsid
++pid_t setsid(void);
++// cdecl_func_sleep
++unsigned sleep(unsigned);
++// cdecl_func_usleep
++int usleep(useconds_t);
++// cdecl_func_write
++ssize_t write(int, const void *, size_t);
++// cdecl_func_memchr
++void *memchr(const void *, int, size_t);
++// cdecl_func_memcmp
++int memcmp(const void *, const void *, size_t);
++// cdecl_func_memmove
++void *memmove(void *, const void *, size_t);
++// cdecl_func_strcasecmp
++int strcasecmp(const char *, const char *);
++// cdecl_func_strcmp
++int strcmp(const char *, const char *);
++// cdecl_func_strcoll
++int strcoll(const char *, const char *);
++// cdecl_func_strdup
++char *strdup(const char *);
++// cdecl_func_strerror
++char *strerror(int);
++// cdecl_func_strncasecmp
++int strncasecmp(const char *, const char *, size_t);
++// cdecl_func_strnlen
++size_t strnlen(const char *, size_t);
++// cdecl_const_SIGTERM
++static const unsigned SIGTERM = 15;
++// cdecl_func_kill
++int kill(pid_t, int);
++// cdecl_const_IFNAMSIZ
++static const unsigned IFNAMSIZ = 16;
++// cdecl_const_IFF_LOOPBACK
++static const unsigned IFF_LOOPBACK = 8;
++// cdecl_const_IFF_UP
++static const unsigned IFF_UP = 1;
++// cdecl_const_IPPROTO_IP
++static const unsigned IPPROTO_IP = 0;
++// cdecl_const_IPPROTO_ICMP
++static const unsigned IPPROTO_ICMP = 1;
++// cdecl_const_RTF_GATEWAY
++static const unsigned RTF_GATEWAY = 2;
++// cdecl_const_RTF_UP
++static const unsigned RTF_UP = 1;
++// cdecl_func_connect
++int connect(int, const struct sockaddr *, socklen_t);
++// cdecl_func_recv
++ssize_t recv(int, void *, size_t, int);
++// cdecl_func_send
++ssize_t send(int, const void *, size_t, int);
++// cdecl_func_sendto
++ssize_t sendto(int, const void *, size_t, int, const struct sockaddr *, socklen_t);
++// cdecl_func_socket
++int socket(int, int, int);
++// cdecl_func_gai_strerror
++const char *gai_strerror(int);
++// cdecl_func_getnameinfo
++int getnameinfo(const struct sockaddr *, socklen_t, char *, socklen_t, char *, socklen_t, int);
++// cdecl_func_inet_aton
++int inet_aton(const char *, struct in_addr *);
++// cdecl_func_statvfs
++int statvfs(const char *, struct statvfs *);
++// cdecl_struct_stat
++struct stat {
++  dev_t st_dev;
++  ino_t st_ino;
++  mode_t st_mode;
++  nlink_t st_nlink;
++  uid_t st_uid;
++  gid_t st_gid;
++  dev_t st_rdev;
++  off_t st_size;
++  struct timespec st_atim;
++  struct timespec st_mtim;
++  struct timespec st_ctim;
++  blksize_t st_blksize;
++  blkcnt_t st_blocks;
++  long st_spare4[2];
++};
++// cdecl_func_fchmod
++int fchmod(int, mode_t);
++int fchmod(int, mode_t);
++// cdecl_func_stat
++int stat(const char *, struct stat *);
++// cdecl_const_WNOHANG
++static const unsigned WNOHANG = 1;
++// cdecl_func_waitpid
++pid_t waitpid(pid_t, int *, int);
++// cdecl_const_MAP_ANONYMOUS
++static const unsigned MAP_ANONYMOUS = 32;
++// cdecl_const_MAP_FAILED
++static const int MAP_FAILED = -1;
++// cdecl_const_MAP_SHARED
++static const unsigned MAP_SHARED = 1;
++// cdecl_const_PROT_READ
++static const unsigned PROT_READ = 1;
++// cdecl_const_PROT_WRITE
++static const unsigned PROT_WRITE = 2;
++// cdecl_func_mmap
++void *mmap(void *, size_t, int, int, int, off_t);
++// cdecl_func_munmap
++int munmap(void *, size_t);
++// cdecl_struct_tm
++struct tm {
++  int tm_sec;
++  int tm_min;
++  int tm_hour;
++  int tm_mday;
++  int tm_mon;
++  int tm_year;
++  int tm_wday;
++  int tm_yday;
++  int tm_isdst;
++};
++// cdecl_func_clock_getres
++int clock_getres(clockid_t, struct timespec *);
++// cdecl_func_clock_gettime
++int clock_gettime(clockid_t, struct timespec *);
++// cdecl_func_gmtime
++struct tm *gmtime(const time_t *);
++// cdecl_func_gmtime_r
++struct tm *gmtime_r(const time_t *, struct tm *);
++// cdecl_func_localtime
++struct tm *localtime(const time_t *);
++// cdecl_func_strftime
++size_t strftime(char *, size_t, const char *, const struct tm *);
++// cdecl_func_time
++time_t time(time_t *);
++// cdecl_func_timegm
++time_t timegm(struct tm *);
++time_t timegm(struct tm *);
++// cdecl_struct_timezone
++struct timezone {
++  int tz_minuteswest;
++  int tz_dsttime;
++};
++// cdecl_func_gettimeofday
++int gettimeofday(struct timeval *, void *);
++// cdecl_func_settimeofday
++int settimeofday(const struct timeval *, const struct timezone *);
++// cdecl_const_PRIO_PROCESS
++static const unsigned PRIO_PROCESS = 0;
++// cdecl_const_PRIO_PGRP
++static const unsigned PRIO_PGRP = 1;
++// cdecl_const_PRIO_USER
++static const unsigned PRIO_USER = 2;
++// cdecl_const_TCIFLUSH
++static const unsigned TCIFLUSH = 0;
++// cdecl_func_tcdrain
++int tcdrain(int);
++// cdecl_func_tcflush
++int tcflush(int, int);
++// cdecl_func_htonl
++uint32_t htonl(uint32_t);
++// cdecl_func_htons
++uint16_t htons(uint16_t);
++// cdecl_func_ntohl
++uint32_t ntohl(uint32_t);
++// cdecl_func_ntohs
++uint16_t ntohs(uint16_t);
++// cdecl_func_ioctl
++int ioctl(int, int, ...);
++// cdecl_const_ICMP_ECHO
++static const unsigned ICMP_ECHO = 8;
++// cdecl_const_ICMP_ECHOREPLY
++static const unsigned ICMP_ECHOREPLY = 0;
++// cdecl_const_ICMP_MINLEN
++static const unsigned ICMP_MINLEN = 8;
++]]
+diff --git a/ffi-cdecl/switch_cdecl.c b/ffi-cdecl/switch_cdecl.c
+new file mode 100644
+index 00000000..a8affe05
+--- /dev/null
++++ b/ffi-cdecl/switch_cdecl.c
+@@ -0,0 +1,25 @@
++// Nintendo Switch native glue (c.f., `switch/koswitch.h` & `ffi/switch_h.lua`).
++// NOTE: only used to generate the static symbol table (`switch/gen_symtab.py`).
++
++#include "switch/koswitch.h"
++
++#include "ffi-cdecl.h"
++
++cdecl_func(ko_fb_init)
++cdecl_func(ko_fb_close)
++cdecl_func(ko_fb_present)
++cdecl_func(ko_input_init)
++cdecl_func(ko_input_poll)
++cdecl_func(ko_get_product_model)
++cdecl_func(ko_is_applet_mode)
++cdecl_func(ko_get_operation_mode)
++cdecl_func(ko_get_battery_percentage)
++cdecl_func(ko_is_charging)
++cdecl_func(ko_get_brightness)
++cdecl_func(ko_set_brightness)
++cdecl_func(ko_is_network_connected)
++cdecl_func(ko_set_auto_sleep_inhibited)
++
++// libc functions provided by `switch/compat.c`.
++cdecl_func(basename)
++cdecl_func(dirname)
+diff --git a/ffi/framebuffer_switch.lua b/ffi/framebuffer_switch.lua
+new file mode 100644
+index 00000000..d3ad11e1
+--- /dev/null
++++ b/ffi/framebuffer_switch.lua
+@@ -0,0 +1,66 @@
++--[[--
++Framebuffer implementation for Nintendo Switch homebrew (libnx).
++
++The panel is 1280x720 (landscape). We draw into a BBRGB32 buffer, which has the
++same memory layout as the libnx framebuffer (RGBA8888), and present it with a
++straight copy. The UI is meant to be used in portrait, with the console held
++sideways like a book: the device sets `is_always_portrait`, so the buffer is
++rotated by the generic framebuffer code (and touch input accordingly).
++
++@module ffi.framebuffer_switch
++--]]
++
++local BB = require("ffi/blitbuffer")
++local ffi = require("ffi")
++local C = ffi.C
++
++require("ffi/switch_h")
++
++local framebuffer = {
++    painting = false,
++    dirty = false,
++}
++
++function framebuffer:init()
++    if C.ko_fb_init() ~= 0 then
++        error("cannot initialize the framebuffer")
++    end
++    self.bb = BB.new(C.KO_FB_WIDTH, C.KO_FB_HEIGHT, BB.TYPE_BBRGB32)
++    self.bb:fill(BB.COLOR_WHITE)
++    -- NOTE: nothing is presented until the first refresh, so the launcher's splash screen stays up meanwhile.
++    framebuffer.parent.init(self)
++end
++
++function framebuffer:_present()
++    self.dirty = false
++    local bb = self.full_bb or self.bb
++    -- Rotation is just a view: the memory is always laid out in the panel's native orientation.
++    -- Inversion (night mode) is ignored by the C blitter, so it's applied when presenting (like on Android).
++    local invert = bb:getInverse() == 1 and BB:getUseCBB()
++    C.ko_fb_present(ffi.cast("const uint8_t *", bb.data), bb.pixel_stride, invert and 1 or 0)
++end
++
++-- The whole frame is presented at once, so coalesce the refreshes of a paint batch.
++function framebuffer:beforePaint()
++    self.painting = true
++end
++
++function framebuffer:afterPaint()
++    self.painting = false
++    if self.dirty then
++        self:_present()
++    end
++end
++
++function framebuffer:refreshFullImp(x, y, w, h) -- luacheck: ignore
++    self.dirty = true
++    if not self.painting then
++        self:_present()
++    end
++end
++
++function framebuffer:close()
++    -- NOTE: the launcher tears down the framebuffer on exit (and may still need it to report errors).
++end
++
++return require("ffi/framebuffer"):extend(framebuffer)
+diff --git a/ffi/input_switch.lua b/ffi/input_switch.lua
+new file mode 100644
+index 00000000..6e9baa8f
+--- /dev/null
++++ b/ffi/input_switch.lua
+@@ -0,0 +1,60 @@
++--[[--
++Input implementation for Nintendo Switch homebrew (libnx).
++
++The port is operated with the touch screen only. Events are translated to
++<linux/input.h> events by the native glue (c.f., `switch/input.c`):
++multi-touch protocol B for the touch screen, and EV_SDL for platform events
++(exit request, docking…).
++
++@module ffi.input_switch
++--]]
++
++local ffi = require("ffi")
++local C = ffi.C
++
++require("ffi/posix_h")
++require("ffi/linux_input_h")
++require("ffi/switch_h")
++
++local MAX_EVENTS = 128
++local events = ffi.new("ko_input_event[?]", MAX_EVENTS)
++
++local input = {
++    -- NOPs
++    open = function() end,
++    close = function() end,
++    closeAll = function() end,
++    fakeTapInput = function() end,
++    -- Tell front that we're a custom imp with no concept of paths/fd
++    is_ffi = true,
++}
++
++function input.waitForEvent(sec, usec)
++    local timeout_ms = -1
++    if sec then
++        -- Round up, so we don't busy loop on sub-millisecond timeouts.
++        timeout_ms = math.ceil(sec * 1000 + usec / 1000)
++    end
++    local count = C.ko_input_poll(events, MAX_EVENTS, timeout_ms)
++    if count <= 0 then
++        return false, C.ETIME
++    end
++    local queue = {}
++    for i = 0, count - 1 do
++        local ev = events[i]
++        queue[i + 1] = {
++            type = tonumber(ev.type),
++            code = tonumber(ev.code),
++            value = tonumber(ev.value),
++            time = {
++                sec = tonumber(ev.sec),
++                usec = tonumber(ev.usec),
++            },
++        }
++    end
++    return true, queue
++end
++
++C.ko_input_init()
++
++return input
+diff --git a/ffi/loadlib.lua b/ffi/loadlib.lua
+index 175d22c0..cf83a087 100644
+--- a/ffi/loadlib.lua
++++ b/ffi/loadlib.lua
+@@ -21,6 +21,19 @@ local android = ffi.os == "Linux" and os.getenv("IS_ANDROID") and require("andro
+ -- NOTE: the `ffi.log` override is used by some tools to silence loadlib's traces.
+ local log = ffi.log or android and android.LOGI or print
+ 
++if ffi.os == "Switch" then
++    -- Nintendo Switch homebrew: there's no dynamic loader, everything is statically
++    -- linked into the executable, and symbols are resolved through a table generated
++    -- at link time (the launcher also handles `require` for Lua C modules).
++    ffi.load = function()
++        return ffi.C
++    end
++    ffi.loadlib = function()
++        return ffi.C
++    end
++    return
++end
++
+ local monolibtic = {
+     path = (android and android.nativeLibraryDir or "libs") .. "/libkoreader-monolibtic." .. (ffi.os == "OSX" and "dylib" or "so"),
+     redirects = {
+diff --git a/ffi/posix_h.lua b/ffi/posix_h.lua
+index 0bc49a0d..10b3e45f 100644
+--- a/ffi/posix_h.lua
++++ b/ffi/posix_h.lua
+@@ -10,7 +10,7 @@ elseif ffi.os == "OSX" then
+ else
+     platform_str = ffi.os:lower() .. "_" .. ffi.arch
+ end
+-local platform = ({ android_arm=0x1, android_arm64=0x2, android_x64=0x4, android_x86=0x8, linux_arm=0x10, linux_arm64=0x20, linux_x64=0x40, macos=0x80 })[platform_str]
++local platform = ({ android_arm=0x1, android_arm64=0x2, android_x64=0x4, android_x86=0x8, linux_arm=0x10, linux_arm64=0x20, linux_x64=0x40, macos=0x80, switch_arm64=0x100 })[platform_str]
+ if not platform then
+     error("unsupported platform: " .. platform_str)
+ end
+@@ -23,7 +23,7 @@ if ffi.os == "Linux" then
+     pcall(ffi.load, "rt.so.1", true)
+ end
+ 
+-if --[[ android_arm|android_arm64|android_x64|android_x86|linux_arm|linux_arm64|linux_x64 ]] bit.band(platform, 0x7f) ~= 0 then
++if --[[ android_arm|android_arm64|android_x64|android_x86|linux_arm|linux_arm64|linux_x64|switch_arm64 ]] bit.band(platform, 0x17f) ~= 0 then
+ ffi.cdef[[ static const unsigned EAGAIN = 11; ]]
+ elseif --[[ macos ]] platform == 0x80 then
+ ffi.cdef[[ static const unsigned EAGAIN = 35; ]]
+@@ -39,6 +39,8 @@ if --[[ android_arm|android_arm64|android_x64|android_x86|linux_arm|linux_arm64|
+ ffi.cdef[[ static const unsigned ENOSYS = 38; ]]
+ elseif --[[ macos ]] platform == 0x80 then
+ ffi.cdef[[ static const unsigned ENOSYS = 78; ]]
++elseif --[[ switch_arm64 ]] platform == 0x100 then
++ffi.cdef[[ static const unsigned ENOSYS = 88; ]]
+ end
+ 
+ ffi.cdef[[
+@@ -46,24 +48,46 @@ static const unsigned EPERM = 1;
+ static const unsigned EPIPE = 32;
+ ]]
+ 
++if --[[ android_arm|android_arm64|android_x64|android_x86|linux_arm|linux_arm64|linux_x64|switch_arm64 ]] bit.band(platform, 0x17f) ~= 0 then
++ffi.cdef[[ static const unsigned ETIME = 62; ]]
++elseif --[[ macos ]] platform == 0x80 then
++ffi.cdef[[ static const unsigned ETIME = 101; ]]
++end
++
+ if --[[ android_arm|android_arm64|android_x64|android_x86|linux_arm|linux_arm64|linux_x64 ]] bit.band(platform, 0x7f) ~= 0 then
+-ffi.cdef[[
+-static const unsigned ETIME = 62;
+-static const unsigned ETIMEDOUT = 110;
+-static const unsigned O_APPEND = 1024;
+-static const unsigned O_CLOEXEC = 524288;
+-static const unsigned O_CREAT = 64;
+-static const unsigned O_NONBLOCK = 2048;
+-]]
++ffi.cdef[[ static const unsigned ETIMEDOUT = 110; ]]
+ elseif --[[ macos ]] platform == 0x80 then
+-ffi.cdef[[
+-static const unsigned ETIME = 101;
+-static const unsigned ETIMEDOUT = 60;
+-static const unsigned O_APPEND = 8;
+-static const unsigned O_CLOEXEC = 16777216;
+-static const unsigned O_CREAT = 512;
+-static const unsigned O_NONBLOCK = 4;
+-]]
++ffi.cdef[[ static const unsigned ETIMEDOUT = 60; ]]
++elseif --[[ switch_arm64 ]] platform == 0x100 then
++ffi.cdef[[ static const unsigned ETIMEDOUT = 116; ]]
++end
++
++if --[[ android_arm|android_arm64|android_x64|android_x86|linux_arm|linux_arm64|linux_x64 ]] bit.band(platform, 0x7f) ~= 0 then
++ffi.cdef[[ static const unsigned O_APPEND = 1024; ]]
++elseif --[[ macos|switch_arm64 ]] bit.band(platform, 0x180) ~= 0 then
++ffi.cdef[[ static const unsigned O_APPEND = 8; ]]
++end
++
++if --[[ android_arm|android_arm64|android_x64|android_x86|linux_arm|linux_arm64|linux_x64 ]] bit.band(platform, 0x7f) ~= 0 then
++ffi.cdef[[ static const unsigned O_CLOEXEC = 524288; ]]
++elseif --[[ macos ]] platform == 0x80 then
++ffi.cdef[[ static const unsigned O_CLOEXEC = 16777216; ]]
++elseif --[[ switch_arm64 ]] platform == 0x100 then
++ffi.cdef[[ static const unsigned O_CLOEXEC = 262144; ]]
++end
++
++if --[[ android_arm|android_arm64|android_x64|android_x86|linux_arm|linux_arm64|linux_x64 ]] bit.band(platform, 0x7f) ~= 0 then
++ffi.cdef[[ static const unsigned O_CREAT = 64; ]]
++elseif --[[ macos|switch_arm64 ]] bit.band(platform, 0x180) ~= 0 then
++ffi.cdef[[ static const unsigned O_CREAT = 512; ]]
++end
++
++if --[[ android_arm|android_arm64|android_x64|android_x86|linux_arm|linux_arm64|linux_x64 ]] bit.band(platform, 0x7f) ~= 0 then
++ffi.cdef[[ static const unsigned O_NONBLOCK = 2048; ]]
++elseif --[[ macos ]] platform == 0x80 then
++ffi.cdef[[ static const unsigned O_NONBLOCK = 4; ]]
++elseif --[[ switch_arm64 ]] platform == 0x100 then
++ffi.cdef[[ static const unsigned O_NONBLOCK = 16384; ]]
+ end
+ 
+ ffi.cdef[[
+@@ -73,7 +97,7 @@ static const unsigned O_RDWR = 2;
+ 
+ if --[[ android_arm|android_arm64|android_x64|android_x86|linux_arm|linux_arm64|linux_x64 ]] bit.band(platform, 0x7f) ~= 0 then
+ ffi.cdef[[ static const unsigned O_TRUNC = 512; ]]
+-elseif --[[ macos ]] platform == 0x80 then
++elseif --[[ macos|switch_arm64 ]] bit.band(platform, 0x180) ~= 0 then
+ ffi.cdef[[ static const unsigned O_TRUNC = 1024; ]]
+ end
+ 
+@@ -104,34 +128,64 @@ if --[[ android_arm|android_arm64|android_x64|android_x86|linux_arm|linux_arm64|
+ ffi.cdef[[
+ static const unsigned PATH_MAX = 4096;
+ static const unsigned CLOCK_BOOTTIME = 7;
++]]
++elseif --[[ macos|switch_arm64 ]] bit.band(platform, 0x180) ~= 0 then
++ffi.cdef[[
++static const unsigned PATH_MAX = 1024;
++static const int CLOCK_BOOTTIME = -1;
++]]
++end
++
++if --[[ android_arm|android_arm64|android_x64|android_x86|linux_arm|linux_arm64|linux_x64 ]] bit.band(platform, 0x7f) ~= 0 then
++ffi.cdef[[
+ static const unsigned CLOCK_MONOTONIC = 1;
+ static const unsigned CLOCK_MONOTONIC_COARSE = 6;
+ ]]
+ elseif --[[ macos ]] platform == 0x80 then
+ ffi.cdef[[
+-static const unsigned PATH_MAX = 1024;
+-static const int CLOCK_BOOTTIME = -1;
+ static const unsigned CLOCK_MONOTONIC = 6;
+ static const unsigned CLOCK_MONOTONIC_COARSE = 5;
+ ]]
++elseif --[[ switch_arm64 ]] platform == 0x100 then
++ffi.cdef[[
++static const unsigned CLOCK_MONOTONIC = 4;
++static const unsigned CLOCK_MONOTONIC_COARSE = 4;
++]]
+ end
+ 
++if --[[ android_arm|android_arm64|android_x64|android_x86|linux_arm|linux_arm64|linux_x64|macos ]] bit.band(platform, 0xff) ~= 0 then
+ ffi.cdef[[ static const unsigned CLOCK_REALTIME = 0; ]]
++elseif --[[ switch_arm64 ]] platform == 0x100 then
++ffi.cdef[[ static const unsigned CLOCK_REALTIME = 1; ]]
++end
+ 
+ if --[[ android_arm|android_arm64|android_x64|android_x86|linux_arm|linux_arm64|linux_x64 ]] bit.band(platform, 0x7f) ~= 0 then
+ ffi.cdef[[
+ static const unsigned CLOCK_REALTIME_COARSE = 5;
+ typedef int clockid_t;
+-static const unsigned FIONREAD = 21531;
+-typedef long suseconds_t;
+ ]]
+ elseif --[[ macos ]] platform == 0x80 then
+ ffi.cdef[[
+ static const int CLOCK_REALTIME_COARSE = -1;
+ typedef unsigned clockid_t;
+-static const unsigned FIONREAD = 1074030207;
+-typedef int32_t suseconds_t;
+ ]]
++elseif --[[ switch_arm64 ]] platform == 0x100 then
++ffi.cdef[[
++static const unsigned CLOCK_REALTIME_COARSE = 1;
++typedef unsigned long clockid_t;
++]]
++end
++
++if --[[ android_arm|android_arm64|android_x64|android_x86|linux_arm|linux_arm64|linux_x64 ]] bit.band(platform, 0x7f) ~= 0 then
++ffi.cdef[[ static const unsigned FIONREAD = 21531; ]]
++elseif --[[ macos|switch_arm64 ]] bit.band(platform, 0x180) ~= 0 then
++ffi.cdef[[ static const unsigned FIONREAD = 1074030207; ]]
++end
++
++if --[[ android_arm|android_arm64|android_x64|android_x86|linux_arm|linux_arm64|linux_x64|switch_arm64 ]] bit.band(platform, 0x17f) ~= 0 then
++ffi.cdef[[ typedef long suseconds_t; ]]
++elseif --[[ macos ]] platform == 0x80 then
++ffi.cdef[[ typedef int32_t suseconds_t; ]]
+ end
+ 
+ ffi.cdef[[ typedef long time_t; ]]
+@@ -140,6 +194,8 @@ if --[[ android_arm|android_arm64|android_x64|android_x86|macos ]] bit.band(plat
+ ffi.cdef[[ typedef uint32_t useconds_t; ]]
+ elseif --[[ linux_arm|linux_arm64|linux_x64 ]] bit.band(platform, 0x70) ~= 0 then
+ ffi.cdef[[ typedef unsigned useconds_t; ]]
++elseif --[[ switch_arm64 ]] platform == 0x100 then
++ffi.cdef[[ typedef unsigned long useconds_t; ]]
+ end
+ 
+ ffi.cdef[[
+@@ -153,13 +209,13 @@ struct timespec {
+ };
+ ]]
+ 
+-if --[[ linux_arm|linux_arm64|linux_x64 ]] bit.band(platform, 0x70) ~= 0 then
++if --[[ linux_arm|linux_arm64|linux_x64|switch_arm64 ]] bit.band(platform, 0x170) ~= 0 then
+ ffi.cdef[[ typedef long blkcnt_t; ]]
+ elseif --[[ macos ]] platform == 0x80 then
+ ffi.cdef[[ typedef int64_t blkcnt_t; ]]
+ end
+ 
+-if --[[ linux_arm|linux_x64 ]] bit.band(platform, 0x50) ~= 0 then
++if --[[ linux_arm|linux_x64|switch_arm64 ]] bit.band(platform, 0x150) ~= 0 then
+ ffi.cdef[[ typedef long blksize_t; ]]
+ elseif --[[ linux_arm64 ]] platform == 0x20 then
+ ffi.cdef[[ typedef int blksize_t; ]]
+@@ -177,20 +233,28 @@ elseif --[[ linux_arm64|linux_x64 ]] bit.band(platform, 0x60) ~= 0 then
+ ffi.cdef[[ typedef unsigned long dev_t; ]]
+ elseif --[[ macos ]] platform == 0x80 then
+ ffi.cdef[[ typedef int32_t dev_t; ]]
++elseif --[[ switch_arm64 ]] platform == 0x100 then
++ffi.cdef[[ typedef short dev_t; ]]
++end
++
++if --[[ android_arm|android_arm64|android_x64|android_x86|macos|switch_arm64 ]] bit.band(platform, 0x18f) ~= 0 then
++ffi.cdef[[ typedef uint32_t id_t; ]]
++elseif --[[ linux_arm|linux_arm64|linux_x64 ]] bit.band(platform, 0x70) ~= 0 then
++ffi.cdef[[ typedef unsigned id_t; ]]
+ end
+ 
+ if --[[ android_arm|android_arm64|android_x64|android_x86|macos ]] bit.band(platform, 0x8f) ~= 0 then
+-ffi.cdef[[
+-typedef uint32_t id_t;
+-typedef uint32_t gid_t;
+-typedef uint32_t id_t;
+-]]
++ffi.cdef[[ typedef uint32_t gid_t; ]]
+ elseif --[[ linux_arm|linux_arm64|linux_x64 ]] bit.band(platform, 0x70) ~= 0 then
+-ffi.cdef[[
+-typedef unsigned id_t;
+-typedef unsigned gid_t;
+-typedef unsigned id_t;
+-]]
++ffi.cdef[[ typedef unsigned gid_t; ]]
++elseif --[[ switch_arm64 ]] platform == 0x100 then
++ffi.cdef[[ typedef unsigned short gid_t; ]]
++end
++
++if --[[ android_arm|android_arm64|android_x64|android_x86|macos|switch_arm64 ]] bit.band(platform, 0x18f) ~= 0 then
++ffi.cdef[[ typedef uint32_t id_t; ]]
++elseif --[[ linux_arm|linux_arm64|linux_x64 ]] bit.band(platform, 0x70) ~= 0 then
++ffi.cdef[[ typedef unsigned id_t; ]]
+ end
+ 
+ if --[[ macos ]] platform == 0x80 then
+@@ -199,6 +263,8 @@ end
+ 
+ if --[[ android_arm|android_arm64|android_x64|android_x86|linux_arm|linux_arm64|linux_x64 ]] bit.band(platform, 0x7f) ~= 0 then
+ ffi.cdef[[ typedef unsigned long ino_t; ]]
++elseif --[[ switch_arm64 ]] platform == 0x100 then
++ffi.cdef[[ typedef unsigned short ino_t; ]]
+ end
+ 
+ if --[[ android_arm|android_x86 ]] bit.band(platform, 0x9) ~= 0 then
+@@ -207,18 +273,20 @@ elseif --[[ android_arm64|android_x64|linux_arm|linux_arm64|linux_x64 ]] bit.ban
+ ffi.cdef[[ typedef unsigned mode_t; ]]
+ elseif --[[ macos ]] platform == 0x80 then
+ ffi.cdef[[ typedef uint16_t mode_t; ]]
++elseif --[[ switch_arm64 ]] platform == 0x100 then
++ffi.cdef[[ typedef uint32_t mode_t; ]]
+ end
+ 
+ if --[[ android_arm|android_arm64|android_x64|android_x86|linux_arm|linux_arm64|linux_x64 ]] bit.band(platform, 0x7f) ~= 0 then
+-ffi.cdef[[
+-typedef long off_t;
+-typedef int pid_t;
+-]]
++ffi.cdef[[ typedef long off_t; ]]
++elseif --[[ macos|switch_arm64 ]] bit.band(platform, 0x180) ~= 0 then
++ffi.cdef[[ typedef int64_t off_t; ]]
++end
++
++if --[[ android_arm|android_arm64|android_x64|android_x86|linux_arm|linux_arm64|linux_x64|switch_arm64 ]] bit.band(platform, 0x17f) ~= 0 then
++ffi.cdef[[ typedef int pid_t; ]]
+ elseif --[[ macos ]] platform == 0x80 then
+-ffi.cdef[[
+-typedef int64_t off_t;
+-typedef int32_t pid_t;
+-]]
++ffi.cdef[[ typedef int32_t pid_t; ]]
+ end
+ 
+ if --[[ android_arm|android_arm64|android_x64|android_x86 ]] bit.band(platform, 0xf) ~= 0 then
+@@ -229,24 +297,28 @@ elseif --[[ linux_x64 ]] platform == 0x40 then
+ ffi.cdef[[ typedef unsigned long nlink_t; ]]
+ elseif --[[ macos ]] platform == 0x80 then
+ ffi.cdef[[ typedef uint16_t nlink_t; ]]
++elseif --[[ switch_arm64 ]] platform == 0x100 then
++ffi.cdef[[ typedef unsigned short nlink_t; ]]
+ end
+ 
+ if --[[ android_arm|android_arm64|android_x64|android_x86|linux_arm|linux_arm64|linux_x64 ]] bit.band(platform, 0x7f) ~= 0 then
+-ffi.cdef[[
+-typedef long off_t;
+-typedef int pid_t;
+-]]
++ffi.cdef[[ typedef long off_t; ]]
++elseif --[[ macos|switch_arm64 ]] bit.band(platform, 0x180) ~= 0 then
++ffi.cdef[[ typedef int64_t off_t; ]]
++end
++
++if --[[ android_arm|android_arm64|android_x64|android_x86|linux_arm|linux_arm64|linux_x64|switch_arm64 ]] bit.band(platform, 0x17f) ~= 0 then
++ffi.cdef[[ typedef int pid_t; ]]
+ elseif --[[ macos ]] platform == 0x80 then
+-ffi.cdef[[
+-typedef int64_t off_t;
+-typedef int32_t pid_t;
+-]]
++ffi.cdef[[ typedef int32_t pid_t; ]]
+ end
+ 
+ if --[[ android_arm|android_arm64|android_x64|android_x86|macos ]] bit.band(platform, 0x8f) ~= 0 then
+ ffi.cdef[[ typedef uint32_t uid_t; ]]
+ elseif --[[ linux_arm|linux_arm64|linux_x64 ]] bit.band(platform, 0x70) ~= 0 then
+ ffi.cdef[[ typedef unsigned uid_t; ]]
++elseif --[[ switch_arm64 ]] platform == 0x100 then
++ffi.cdef[[ typedef unsigned short uid_t; ]]
+ end
+ 
+ if --[[ android_arm|android_arm64|android_x64|android_x86|linux_arm|linux_arm64|linux_x64 ]] bit.band(platform, 0x7f) ~= 0 then
+@@ -259,9 +331,14 @@ ffi.cdef[[
+ typedef unsigned fsblkcnt_t;
+ typedef unsigned fsfilcnt_t;
+ ]]
++elseif --[[ switch_arm64 ]] platform == 0x100 then
++ffi.cdef[[
++typedef uint64_t fsblkcnt_t;
++typedef uint32_t fsfilcnt_t;
++]]
+ end
+ 
+-if --[[ android_arm|android_x86|macos ]] bit.band(platform, 0x89) ~= 0 then
++if --[[ android_arm|android_x86|macos|switch_arm64 ]] bit.band(platform, 0x189) ~= 0 then
+ ffi.cdef[[
+ struct statvfs {
+   unsigned long f_bsize;
+@@ -359,6 +436,8 @@ if --[[ android_arm|android_arm64|android_x64|android_x86|linux_arm|linux_arm64|
+ ffi.cdef[[ static const unsigned AF_INET6 = 10; ]]
+ elseif --[[ macos ]] platform == 0x80 then
+ ffi.cdef[[ static const unsigned AF_INET6 = 30; ]]
++elseif --[[ switch_arm64 ]] platform == 0x100 then
++ffi.cdef[[ static const unsigned AF_INET6 = 28; ]]
+ end
+ 
+ if --[[ macos ]] platform == 0x80 then
+@@ -374,7 +453,7 @@ static const unsigned AF_UNIX = 1;
+ static const unsigned NI_MAXHOST = 1025;
+ ]]
+ 
+-if --[[ android_arm|android_arm64|android_x64|android_x86|macos ]] bit.band(platform, 0x8f) ~= 0 then
++if --[[ android_arm|android_arm64|android_x64|android_x86|macos|switch_arm64 ]] bit.band(platform, 0x18f) ~= 0 then
+ ffi.cdef[[ static const unsigned NI_NUMERICHOST = 2; ]]
+ elseif --[[ linux_arm|linux_arm64|linux_x64 ]] bit.band(platform, 0x70) ~= 0 then
+ ffi.cdef[[ static const unsigned NI_NUMERICHOST = 1; ]]
+@@ -384,6 +463,8 @@ if --[[ android_arm|android_arm64|android_x64|android_x86|linux_arm|linux_arm64|
+ ffi.cdef[[ static const unsigned SOCK_CLOEXEC = 524288; ]]
+ elseif --[[ macos ]] platform == 0x80 then
+ ffi.cdef[[ static const unsigned SOCK_CLOEXEC = 0; ]]
++elseif --[[ switch_arm64 ]] platform == 0x100 then
++ffi.cdef[[ static const unsigned SOCK_CLOEXEC = 268435456; ]]
+ end
+ 
+ ffi.cdef[[ static const unsigned SOCK_DGRAM = 2; ]]
+@@ -392,6 +473,8 @@ if --[[ android_arm|android_arm64|android_x64|android_x86|linux_arm|linux_arm64|
+ ffi.cdef[[ static const unsigned SOCK_NONBLOCK = 2048; ]]
+ elseif --[[ macos ]] platform == 0x80 then
+ ffi.cdef[[ static const unsigned SOCK_NONBLOCK = 0; ]]
++elseif --[[ switch_arm64 ]] platform == 0x100 then
++ffi.cdef[[ static const unsigned SOCK_NONBLOCK = 536870912; ]]
+ end
+ 
+ ffi.cdef[[
+@@ -399,7 +482,7 @@ static const unsigned SOCK_RAW = 3;
+ static const unsigned SOCK_SEQPACKET = 5;
+ ]]
+ 
+-if --[[ linux_arm|linux_arm64|linux_x64|macos ]] bit.band(platform, 0xf0) ~= 0 then
++if --[[ linux_arm|linux_arm64|linux_x64|macos|switch_arm64 ]] bit.band(platform, 0x1f0) ~= 0 then
+ ffi.cdef[[ typedef char *caddr_t; ]]
+ end
+ 
+@@ -410,13 +493,13 @@ typedef uint16_t in_port_t;
+ 
+ if --[[ android_arm|android_arm64|android_x64|android_x86|linux_arm|linux_arm64|linux_x64 ]] bit.band(platform, 0x7f) ~= 0 then
+ ffi.cdef[[ typedef unsigned short sa_family_t; ]]
+-elseif --[[ macos ]] platform == 0x80 then
++elseif --[[ macos|switch_arm64 ]] bit.band(platform, 0x180) ~= 0 then
+ ffi.cdef[[ typedef uint8_t sa_family_t; ]]
+ end
+ 
+ if --[[ android_arm|android_x86 ]] bit.band(platform, 0x9) ~= 0 then
+ ffi.cdef[[ typedef int32_t socklen_t; ]]
+-elseif --[[ android_arm64|android_x64|macos ]] bit.band(platform, 0x86) ~= 0 then
++elseif --[[ android_arm64|android_x64|macos|switch_arm64 ]] bit.band(platform, 0x186) ~= 0 then
+ ffi.cdef[[ typedef uint32_t socklen_t; ]]
+ elseif --[[ linux_arm|linux_arm64|linux_x64 ]] bit.band(platform, 0x70) ~= 0 then
+ ffi.cdef[[ typedef unsigned socklen_t; ]]
+@@ -458,6 +541,16 @@ struct in6_addr {
+   } __u6_addr;
+ };
+ ]]
++elseif --[[ switch_arm64 ]] platform == 0x100 then
++ffi.cdef[[
++struct in6_addr {
++  union {
++    uint16_t __u6_addr16[8];
++    uint32_t __u6_addr32[4];
++    unsigned char s6_addr[16];
++  };
++};
++]]
+ end
+ 
+ if --[[ android_arm|android_arm64|android_x64|android_x86|linux_arm|linux_arm64|linux_x64 ]] bit.band(platform, 0x7f) ~= 0 then
+@@ -475,6 +568,14 @@ struct sockaddr {
+   char sa_data[14];
+ };
+ ]]
++elseif --[[ switch_arm64 ]] platform == 0x100 then
++ffi.cdef[[
++struct sockaddr {
++  unsigned char sa_len;
++  sa_family_t sa_family;
++  char sa_data[14];
++};
++]]
+ end
+ 
+ if --[[ macos ]] platform == 0x80 then
+@@ -526,13 +627,6 @@ struct sockaddr_in {
+   struct in_addr sin_addr;
+   unsigned char __pad[16 - sizeof (short) - sizeof (unsigned short) - sizeof (struct in_addr)];
+ };
+-struct sockaddr_in6 {
+-  unsigned short sin6_family;
+-  uint16_t sin6_port;
+-  uint32_t sin6_flowinfo;
+-  struct in6_addr sin6_addr;
+-  uint32_t sin6_scope_id;
+-};
+ ]]
+ elseif --[[ linux_arm|linux_arm64|linux_x64 ]] bit.band(platform, 0x70) ~= 0 then
+ ffi.cdef[[
+@@ -542,6 +636,31 @@ struct sockaddr_in {
+   struct in_addr sin_addr;
+   unsigned char sin_zero[sizeof (struct sockaddr) - (sizeof (unsigned short)) - sizeof (in_port_t) - sizeof (struct in_addr)];
+ };
++]]
++elseif --[[ macos|switch_arm64 ]] bit.band(platform, 0x180) ~= 0 then
++ffi.cdef[[
++struct sockaddr_in {
++  uint8_t sin_len;
++  sa_family_t sin_family;
++  in_port_t sin_port;
++  struct in_addr sin_addr;
++  char sin_zero[8];
++};
++]]
++end
++
++if --[[ android_arm|android_arm64|android_x64|android_x86 ]] bit.band(platform, 0xf) ~= 0 then
++ffi.cdef[[
++struct sockaddr_in6 {
++  unsigned short sin6_family;
++  uint16_t sin6_port;
++  uint32_t sin6_flowinfo;
++  struct in6_addr sin6_addr;
++  uint32_t sin6_scope_id;
++};
++]]
++elseif --[[ linux_arm|linux_arm64|linux_x64|switch_arm64 ]] bit.band(platform, 0x170) ~= 0 then
++ffi.cdef[[
+ struct sockaddr_in6 {
+   sa_family_t sin6_family;
+   in_port_t sin6_port;
+@@ -552,13 +671,6 @@ struct sockaddr_in6 {
+ ]]
+ elseif --[[ macos ]] platform == 0x80 then
+ ffi.cdef[[
+-struct sockaddr_in {
+-  uint8_t sin_len;
+-  sa_family_t sin_family;
+-  in_port_t sin_port;
+-  struct in_addr sin_addr;
+-  char sin_zero[8];
+-};
+ struct sockaddr_in6 {
+   uint8_t sin6_len;
+   sa_family_t sin6_family;
+@@ -625,6 +737,16 @@ struct sockaddr_storage {
+   char __ss_pad2[(128 - sizeof (uint8_t) - sizeof (sa_family_t) - ((sizeof (int64_t)) - sizeof (uint8_t) - sizeof (sa_family_t)) - (sizeof (int64_t)))];
+ };
+ ]]
++elseif --[[ switch_arm64 ]] platform == 0x100 then
++ffi.cdef[[
++struct sockaddr_storage {
++  unsigned char ss_len;
++  sa_family_t ss_family;
++  char __ss_pad1[((sizeof (int64_t)) - sizeof (unsigned char) - sizeof (sa_family_t))];
++  int64_t __ss_align;
++  char __ss_pad2[(128U - sizeof (unsigned char) - sizeof (sa_family_t) - ((sizeof (int64_t)) - sizeof (unsigned char) - sizeof (sa_family_t)) - (sizeof (int64_t)))];
++};
++]]
+ end
+ 
+ if --[[ android_arm|android_arm64|android_x64|android_x86|linux_arm|linux_arm64|linux_x64 ]] bit.band(platform, 0x7f) ~= 0 then
+@@ -795,7 +917,7 @@ struct iwreq {
+ ]]
+ end
+ 
+-if --[[ android_arm|android_arm64|android_x64|android_x86|macos ]] bit.band(platform, 0x8f) ~= 0 then
++if --[[ android_arm|android_arm64|android_x64|android_x86|macos|switch_arm64 ]] bit.band(platform, 0x18f) ~= 0 then
+ ffi.cdef[[ typedef unsigned nfds_t; ]]
+ elseif --[[ linux_arm|linux_arm64|linux_x64 ]] bit.band(platform, 0x70) ~= 0 then
+ ffi.cdef[[ typedef unsigned long nfds_t; ]]
+@@ -814,6 +936,8 @@ if --[[ android_arm|android_arm64|android_x64|android_x86|linux_arm|linux_arm64|
+ ffi.cdef[[ static const unsigned PTHREAD_CREATE_DETACHED = 1; ]]
+ elseif --[[ macos ]] platform == 0x80 then
+ ffi.cdef[[ static const unsigned PTHREAD_CREATE_DETACHED = 2; ]]
++elseif --[[ switch_arm64 ]] platform == 0x100 then
++ffi.cdef[[ static const unsigned PTHREAD_CREATE_DETACHED = 0; ]]
+ end
+ 
+ if --[[ macos ]] platform == 0x80 then
+@@ -875,6 +999,19 @@ elseif --[[ linux_arm64|linux_x64 ]] bit.band(platform, 0x60) ~= 0 then
+ ffi.cdef[[ typedef union pthread_attr_t pthread_attr_t; ]]
+ elseif --[[ macos ]] platform == 0x80 then
+ ffi.cdef[[ typedef struct _opaque_pthread_attr_t pthread_attr_t; ]]
++elseif --[[ switch_arm64 ]] platform == 0x100 then
++ffi.cdef[[
++// NOTE: `schedparam` is `struct sched_param` (a single `int sched_priority`), inlined
++// so the merged `ffi/posix_h.lua` doesn't forward-reference a not-yet-declared struct
++// (only this platform's pthread_attr_t embeds it by value). It's parse-only on Switch:
++// the pthread FFI is never used (no subprocesses), the launcher uses the C pthread API.
++typedef struct {
++  void *stackaddr;
++  int stacksize;
++  struct { int sched_priority; } schedparam;
++  int detachstate;
++} pthread_attr_t;
++]]
+ end
+ 
+ if --[[ android_arm|android_arm64|android_x64|android_x86 ]] bit.band(platform, 0xf) ~= 0 then
+@@ -883,6 +1020,8 @@ elseif --[[ linux_arm|linux_arm64|linux_x64 ]] bit.band(platform, 0x70) ~= 0 the
+ ffi.cdef[[ typedef unsigned long pthread_t; ]]
+ elseif --[[ macos ]] platform == 0x80 then
+ ffi.cdef[[ typedef struct _opaque_pthread_t *pthread_t; ]]
++elseif --[[ switch_arm64 ]] platform == 0x100 then
++ffi.cdef[[ typedef struct __pthread_t *pthread_t; ]]
+ end
+ 
+ ffi.cdef[[
+@@ -893,7 +1032,7 @@ int pthread_attr_setdetachstate(pthread_attr_t *, int);
+ 
+ if --[[ android_arm|android_arm64|android_x64|android_x86 ]] bit.band(platform, 0xf) ~= 0 then
+ ffi.cdef[[ int pthread_create(pthread_t *, pthread_attr_t const *, void *(*)(void *), void *); ]]
+-elseif --[[ linux_arm|linux_arm64|linux_x64|macos ]] bit.band(platform, 0xf0) ~= 0 then
++elseif --[[ linux_arm|linux_arm64|linux_x64|macos|switch_arm64 ]] bit.band(platform, 0x1f0) ~= 0 then
+ ffi.cdef[[ int pthread_create(pthread_t *, const pthread_attr_t *, void *(*)(void *), void *); ]]
+ end
+ 
+@@ -901,7 +1040,7 @@ if --[[ android_arm|android_arm64|android_x64|android_x86|linux_arm|linux_arm64|
+ ffi.cdef[[ static const unsigned SCHED_BATCH = 3; ]]
+ end
+ 
+-if --[[ android_arm|android_arm64|android_x64|android_x86|linux_arm64|linux_x64 ]] bit.band(platform, 0x6f) ~= 0 then
++if --[[ android_arm|android_arm64|android_x64|android_x86|linux_arm64|linux_x64|switch_arm64 ]] bit.band(platform, 0x16f) ~= 0 then
+ ffi.cdef[[
+ struct sched_param {
+   int sched_priority;
+@@ -915,6 +1054,77 @@ struct sched_param {
+ ]]
+ end
+ 
++if --[[ android_arm|android_x86 ]] bit.band(platform, 0x9) ~= 0 then
++ffi.cdef[[
++typedef struct {
++  uint32_t flags;
++  void *stack_base;
++  size_t stack_size;
++  size_t guard_size;
++  int32_t sched_policy;
++  int32_t sched_priority;
++} pthread_attr_t;
++]]
++elseif --[[ android_arm64|android_x64 ]] bit.band(platform, 0x6) ~= 0 then
++ffi.cdef[[
++typedef struct {
++  uint32_t flags;
++  void *stack_base;
++  size_t stack_size;
++  size_t guard_size;
++  int32_t sched_policy;
++  int32_t sched_priority;
++  char __reserved[16];
++} pthread_attr_t;
++]]
++elseif --[[ linux_arm ]] platform == 0x10 then
++ffi.cdef[[
++typedef union {
++  char __size[36];
++  long __align;
++} pthread_attr_t;
++]]
++elseif --[[ linux_arm64|linux_x64 ]] bit.band(platform, 0x60) ~= 0 then
++ffi.cdef[[ typedef union pthread_attr_t pthread_attr_t; ]]
++elseif --[[ macos ]] platform == 0x80 then
++ffi.cdef[[ typedef struct _opaque_pthread_attr_t pthread_attr_t; ]]
++elseif --[[ switch_arm64 ]] platform == 0x100 then
++ffi.cdef[[
++// NOTE: `schedparam` is `struct sched_param` (a single `int sched_priority`), inlined
++// so the merged `ffi/posix_h.lua` doesn't forward-reference a not-yet-declared struct
++// (only this platform's pthread_attr_t embeds it by value). It's parse-only on Switch:
++// the pthread FFI is never used (no subprocesses), the launcher uses the C pthread API.
++typedef struct {
++  void *stackaddr;
++  int stacksize;
++  struct { int sched_priority; } schedparam;
++  int detachstate;
++} pthread_attr_t;
++]]
++end
++
++if --[[ android_arm|android_arm64|android_x64|android_x86 ]] bit.band(platform, 0xf) ~= 0 then
++ffi.cdef[[ typedef long pthread_t; ]]
++elseif --[[ linux_arm|linux_arm64|linux_x64 ]] bit.band(platform, 0x70) ~= 0 then
++ffi.cdef[[ typedef unsigned long pthread_t; ]]
++elseif --[[ macos ]] platform == 0x80 then
++ffi.cdef[[ typedef struct _opaque_pthread_t *pthread_t; ]]
++elseif --[[ switch_arm64 ]] platform == 0x100 then
++ffi.cdef[[ typedef struct __pthread_t *pthread_t; ]]
++end
++
++ffi.cdef[[
++int pthread_attr_destroy(pthread_attr_t *);
++int pthread_attr_init(pthread_attr_t *);
++int pthread_attr_setdetachstate(pthread_attr_t *, int);
++]]
++
++if --[[ android_arm|android_arm64|android_x64|android_x86 ]] bit.band(platform, 0xf) ~= 0 then
++ffi.cdef[[ int pthread_create(pthread_t *, pthread_attr_t const *, void *(*)(void *), void *); ]]
++elseif --[[ linux_arm|linux_arm64|linux_x64|macos|switch_arm64 ]] bit.band(platform, 0x1f0) ~= 0 then
++ffi.cdef[[ int pthread_create(pthread_t *, const pthread_attr_t *, void *(*)(void *), void *); ]]
++end
++
+ if --[[ android_arm|android_arm64|android_x64|android_x86|linux_arm|linux_arm64|linux_x64 ]] bit.band(platform, 0x7f) ~= 0 then
+ ffi.cdef[[ int sched_setscheduler(pid_t, int, const struct sched_param *); ]]
+ end
+@@ -943,21 +1153,28 @@ void *realloc(void *, size_t);
+ char *realpath(const char *, char *);
+ int setenv(const char *, const char *, int);
+ int unsetenv(const char *);
++]]
++
++if --[[ android_arm|android_arm64|android_x64|android_x86|linux_arm|linux_arm64|linux_x64|macos ]] bit.band(platform, 0xff) ~= 0 then
++ffi.cdef[[
+ int unlockpt(int);
+ int grantpt(int);
+ char *ptsname(int);
+ ]]
++end
+ 
+ if --[[ android_arm|android_arm64|android_x64|android_x86 ]] bit.band(platform, 0xf) ~= 0 then
+-ffi.cdef[[
+-char *basename(const char *);
+-char *dirname(const char *);
+-]]
++ffi.cdef[[ char *basename(const char *); ]]
+ elseif --[[ linux_arm|linux_arm64|linux_x64|macos ]] bit.band(platform, 0xf0) ~= 0 then
+-ffi.cdef[[
+-char *basename(char *);
+-char *dirname(char *);
+-]]
++ffi.cdef[[ char *basename(char *); ]]
++elseif --[[ switch_arm64 ]] platform == 0x100 then
++ffi.cdef[[ char *basename(char *)__asm__("""basename"); ]]
++end
++
++if --[[ android_arm|android_arm64|android_x64|android_x86 ]] bit.band(platform, 0xf) ~= 0 then
++ffi.cdef[[ char *dirname(const char *); ]]
++elseif --[[ linux_arm|linux_arm64|linux_x64|macos|switch_arm64 ]] bit.band(platform, 0x1f0) ~= 0 then
++ffi.cdef[[ char *dirname(char *); ]]
+ end
+ 
+ ffi.cdef[[
+@@ -969,7 +1186,7 @@ int fcntl(int, int, ...);
+ int open(const char *, int, ...);
+ ]]
+ 
+-if --[[ android_arm|android_x86|macos ]] bit.band(platform, 0x89) ~= 0 then
++if --[[ android_arm|android_x86|macos|switch_arm64 ]] bit.band(platform, 0x189) ~= 0 then
+ ffi.cdef[[ static const unsigned HAVE_POSIX_FALLOCATE = 0; ]]
+ elseif --[[ android_arm64|android_x64|linux_arm|linux_arm64|linux_x64 ]] bit.band(platform, 0x76) ~= 0 then
+ ffi.cdef[[ static const unsigned HAVE_POSIX_FALLOCATE = 1; ]]
+@@ -1000,7 +1217,7 @@ int execlp(const char *, const char *, ...);
+ 
+ if --[[ android_arm|android_arm64|android_x64|android_x86|macos ]] bit.band(platform, 0x8f) ~= 0 then
+ ffi.cdef[[ int execvp(const char *, char *const *); ]]
+-elseif --[[ linux_arm|linux_arm64|linux_x64 ]] bit.band(platform, 0x70) ~= 0 then
++elseif --[[ linux_arm|linux_arm64|linux_x64|switch_arm64 ]] bit.band(platform, 0x170) ~= 0 then
+ ffi.cdef[[ int execvp(const char *, char *const[]); ]]
+ end
+ 
+@@ -1050,7 +1267,7 @@ const char *gai_strerror(int);
+ 
+ if --[[ android_arm|android_arm64|android_x64|android_x86 ]] bit.band(platform, 0xf) ~= 0 then
+ ffi.cdef[[ int getnameinfo(const struct sockaddr *, socklen_t, char *, size_t, char *, size_t, int); ]]
+-elseif --[[ linux_arm|linux_arm64|linux_x64|macos ]] bit.band(platform, 0xf0) ~= 0 then
++elseif --[[ linux_arm|linux_arm64|linux_x64|macos|switch_arm64 ]] bit.band(platform, 0x1f0) ~= 0 then
+ ffi.cdef[[ int getnameinfo(const struct sockaddr *, socklen_t, char *, socklen_t, char *, socklen_t, int); ]]
+ end
+ 
+@@ -1208,16 +1425,43 @@ struct stat {
+   int64_t st_qspare[2];
+ };
+ ]]
++elseif --[[ switch_arm64 ]] platform == 0x100 then
++ffi.cdef[[
++struct stat {
++  dev_t st_dev;
++  ino_t st_ino;
++  mode_t st_mode;
++  nlink_t st_nlink;
++  uid_t st_uid;
++  gid_t st_gid;
++  dev_t st_rdev;
++  off_t st_size;
++  struct timespec st_atim;
++  struct timespec st_mtim;
++  struct timespec st_ctim;
++  blksize_t st_blksize;
++  blkcnt_t st_blocks;
++  long st_spare4[2];
++};
++]]
+ end
+ 
++if --[[ android_arm|android_arm64|android_x64|android_x86|linux_arm|linux_arm64|linux_x64|macos ]] bit.band(platform, 0xff) ~= 0 then
++ffi.cdef[[ int fchmod(int, mode_t); ]]
++elseif --[[ switch_arm64 ]] platform == 0x100 then
+ ffi.cdef[[
+ int fchmod(int, mode_t);
++int fchmod(int, mode_t);
++]]
++end
++
++ffi.cdef[[
+ int stat(const char *, struct stat *);
+ static const unsigned WNOHANG = 1;
+ pid_t waitpid(pid_t, int *, int);
+ ]]
+ 
+-if --[[ android_arm|android_arm64|android_x64|android_x86|linux_arm|linux_arm64|linux_x64 ]] bit.band(platform, 0x7f) ~= 0 then
++if --[[ android_arm|android_arm64|android_x64|android_x86|linux_arm|linux_arm64|linux_x64|switch_arm64 ]] bit.band(platform, 0x17f) ~= 0 then
+ ffi.cdef[[ static const unsigned MAP_ANONYMOUS = 32; ]]
+ elseif --[[ macos ]] platform == 0x80 then
+ ffi.cdef[[ static const unsigned MAP_ANONYMOUS = 4096; ]]
+@@ -1264,6 +1508,20 @@ struct tm {
+   char *tm_zone;
+ };
+ ]]
++elseif --[[ switch_arm64 ]] platform == 0x100 then
++ffi.cdef[[
++struct tm {
++  int tm_sec;
++  int tm_min;
++  int tm_hour;
++  int tm_mday;
++  int tm_mon;
++  int tm_year;
++  int tm_wday;
++  int tm_yday;
++  int tm_isdst;
++};
++]]
+ end
+ 
+ ffi.cdef[[
+@@ -1280,6 +1538,11 @@ if --[[ android_arm|android_arm64|android_x64|android_x86|linux_arm|linux_arm64|
+ ffi.cdef[[ time_t timegm(struct tm *); ]]
+ elseif --[[ macos ]] platform == 0x80 then
+ ffi.cdef[[ time_t timegm(struct tm *const); ]]
++elseif --[[ switch_arm64 ]] platform == 0x100 then
++ffi.cdef[[
++time_t timegm(struct tm *);
++time_t timegm(struct tm *);
++]]
+ end
+ 
+ ffi.cdef[[
+@@ -1291,7 +1554,7 @@ struct timezone {
+ 
+ if --[[ android_arm|android_arm64|android_x64|android_x86|linux_arm ]] bit.band(platform, 0x1f) ~= 0 then
+ ffi.cdef[[ int gettimeofday(struct timeval *, struct timezone *); ]]
+-elseif --[[ linux_arm64|linux_x64|macos ]] bit.band(platform, 0xe0) ~= 0 then
++elseif --[[ linux_arm64|linux_x64|macos|switch_arm64 ]] bit.band(platform, 0x1e0) ~= 0 then
+ ffi.cdef[[ int gettimeofday(struct timeval *, void *); ]]
+ end
+ 
+@@ -1300,10 +1563,13 @@ int settimeofday(const struct timeval *, const struct timezone *);
+ static const unsigned PRIO_PROCESS = 0;
+ static const unsigned PRIO_PGRP = 1;
+ static const unsigned PRIO_USER = 2;
+-int setpriority(int, id_t, int);
+ ]]
+ 
+-if --[[ android_arm|android_arm64|android_x64|android_x86|linux_arm|linux_arm64|linux_x64 ]] bit.band(platform, 0x7f) ~= 0 then
++if --[[ android_arm|android_arm64|android_x64|android_x86|linux_arm|linux_arm64|linux_x64|macos ]] bit.band(platform, 0xff) ~= 0 then
++ffi.cdef[[ int setpriority(int, id_t, int); ]]
++end
++
++if --[[ android_arm|android_arm64|android_x64|android_x86|linux_arm|linux_arm64|linux_x64|switch_arm64 ]] bit.band(platform, 0x17f) ~= 0 then
+ ffi.cdef[[ static const unsigned TCIFLUSH = 0; ]]
+ elseif --[[ macos ]] platform == 0x80 then
+ ffi.cdef[[ static const unsigned TCIFLUSH = 1; ]]
+@@ -1316,11 +1582,16 @@ uint32_t htonl(uint32_t);
+ uint16_t htons(uint16_t);
+ uint32_t ntohl(uint32_t);
+ uint16_t ntohs(uint16_t);
++]]
++
++if --[[ android_arm|android_arm64|android_x64|android_x86|linux_arm|linux_arm64|linux_x64|macos ]] bit.band(platform, 0xff) ~= 0 then
++ffi.cdef[[
+ void freeifaddrs(struct ifaddrs *);
+ int getifaddrs(struct ifaddrs **);
+ ]]
++end
+ 
+-if --[[ android_arm|android_arm64|android_x64|android_x86 ]] bit.band(platform, 0xf) ~= 0 then
++if --[[ android_arm|android_arm64|android_x64|android_x86|switch_arm64 ]] bit.band(platform, 0x10f) ~= 0 then
+ ffi.cdef[[ int ioctl(int, int, ...); ]]
+ elseif --[[ linux_arm|linux_arm64|linux_x64|macos ]] bit.band(platform, 0xf0) ~= 0 then
+ ffi.cdef[[ int ioctl(int, unsigned long, ...); ]]
+diff --git a/ffi/switch_h.lua b/ffi/switch_h.lua
+new file mode 100644
+index 00000000..45412260
+--- /dev/null
++++ b/ffi/switch_h.lua
+@@ -0,0 +1,32 @@
++-- Native glue for Nintendo Switch homebrew (c.f., `switch/koswitch.h`).
++
++local ffi = require("ffi")
++
++ffi.cdef[[
++static const int KO_FB_WIDTH = 1280;
++static const int KO_FB_HEIGHT = 720;
++static const int KO_SDL_QUIT = 1;
++static const int KO_SDL_OPERATION_MODE = 2;
++typedef struct ko_input_event {
++  int32_t type;
++  int32_t code;
++  int32_t value;
++  int32_t reserved;
++  int64_t sec;
++  int64_t usec;
++} ko_input_event;
++int ko_fb_init(void);
++void ko_fb_close(void);
++void ko_fb_present(const uint8_t *, int, int);
++int ko_input_init(void);
++int ko_input_poll(ko_input_event *, int, int);
++int ko_get_product_model(void);
++int ko_is_applet_mode(void);
++int ko_get_operation_mode(void);
++int ko_get_battery_percentage(void);
++int ko_is_charging(void);
++float ko_get_brightness(void);
++int ko_set_brightness(float);
++int ko_is_network_connected(void);
++void ko_set_auto_sleep_inhibited(int);
++]]
+diff --git a/ffi/util.lua b/ffi/util.lua
+index ab0d8e2a..3b301702 100644
+--- a/ffi/util.lua
++++ b/ffi/util.lua
+@@ -262,18 +262,26 @@ function util.purgeDir(dir)
+     if not ok or err ~= nil then
+         return nil, err
+     end
++    -- Collect the entries before deleting any: removing files while the directory
++    -- handle is still being iterated is unspecified in POSIX, and on some filesystems
++    -- (e.g. the Switch's) it skips entries, so the final rmdir would fail on a
++    -- directory that still looks non-empty.
++    local entries = {}
+     for f in lfs.dir(dir) do
+         if f ~= "." and f ~= ".." then
+-            local fullpath = util.joinPath(dir, f)
+-            local attributes = lfs.attributes(fullpath)
+-            if attributes.mode == "directory" then
+-                ok, err = util.purgeDir(fullpath)
+-            else
+-                ok, err = os.remove(fullpath)
+-            end
+-            if not ok or err ~= nil then
+-                return ok, err
+-            end
++            entries[#entries + 1] = f
++        end
++    end
++    for _, f in ipairs(entries) do
++        local fullpath = util.joinPath(dir, f)
++        local attributes = lfs.attributes(fullpath)
++        if attributes and attributes.mode == "directory" then
++            ok, err = util.purgeDir(fullpath)
++        else
++            ok, err = os.remove(fullpath)
++        end
++        if not ok or err ~= nil then
++            return ok, err
+         end
+     end
+     ok, err = os.remove(dir)
+@@ -331,6 +339,12 @@ function util.removeRunAfterForkParentFunc(id)
+     _run_after_fork_parent_funcs[id] = nil
+ end
+ 
++--- Returns true if the platform can run code in a forked subprocess
++-- (Nintendo Switch homebrew has no fork).
++function util.isSubProcessSupported()
++    return ffi.os ~= "Switch"
++end
++
+ --- Run lua code (func) in a forked subprocess
+ --
+ -- With with_pipe=true, sets up a pipe for communication
+@@ -348,6 +362,9 @@ end
+ --                       as waitpid will return -1 w/ an ECHILD errno.
+ -- NOTE: Assumes the target platform is POSIX compliant.
+ function util.runInSubProcess(func, with_pipe, double_fork)
++    if not util.isSubProcessSupported() then
++        return false, "subprocesses are not supported on this platform"
++    end
+     local parent_read_fd, parent_write_fd
+     local child_read_fd, child_write_fd
+     if with_pipe then
+diff --git a/switch/compat/archive_child.c b/switch/compat/archive_child.c
+new file mode 100644
+index 00000000..be8326e6
+--- /dev/null
++++ b/switch/compat/archive_child.c
+@@ -0,0 +1,26 @@
++/*
++    libarchive's "program" filters (e.g. `archive_read_support_filter_program`) run external
++    commands, which is impossible without `fork`/`exec`: its POSIX implementation of these
++    internal helpers isn't built, so provide failing versions.
++*/
++
++#include <errno.h>
++#include <sys/types.h>
++
++#define ARCHIVE_FAILED (-25)
++
++int __archive_create_child(const char *cmd, int *child_stdin, int *child_stdout, pid_t *out_child)
++{
++    (void)cmd;
++    (void)child_stdin;
++    (void)child_stdout;
++    (void)out_child;
++    errno = ENOSYS;
++    return ARCHIVE_FAILED;
++}
++
++void __archive_check_child(int in, int out)
++{
++    (void)in;
++    (void)out;
++}
+diff --git a/switch/compat/basename.c b/switch/compat/basename.c
+new file mode 100644
+index 00000000..fdd6bda8
+--- /dev/null
++++ b/switch/compat/basename.c
+@@ -0,0 +1,23 @@
++/* POSIX & GNU `basename`. */
++
++#include <stddef.h>
++
++/* POSIX variant (may modify its argument). */
++char *basename(char *path)
++{
++    static char dot[] = ".";
++    if (!path || !*path)
++        return dot;
++    size_t len = __builtin_strlen(path);
++    while (len > 1 && path[len - 1] == '/')
++        path[--len] = '\0';
++    char *slash = __builtin_strrchr(path, '/');
++    return slash && slash[1] ? slash + 1 : path;
++}
++
++/* GNU variant (what `basename` maps to with `_GNU_SOURCE`): never modifies its argument. */
++char *__gnu_basename(const char *path)
++{
++    const char *slash = __builtin_strrchr(path, '/');
++    return (char *)(slash ? slash + 1 : path);
++}
+diff --git a/switch/compat/byteorder.c b/switch/compat/byteorder.c
+new file mode 100644
+index 00000000..866b52ba
+--- /dev/null
++++ b/switch/compat/byteorder.c
+@@ -0,0 +1,27 @@
++/*
++    Byte order functions: libnx only provides them as static inline functions (in
++    <arpa/inet.h>), so there are no symbols for LuaJIT's FFI (`ffi.C.htons`) to use.
++    NOTE: don't include <arpa/inet.h> here, or the definitions would conflict.
++*/
++
++#include <stdint.h>
++
++uint32_t htonl(uint32_t hostlong)
++{
++    return __builtin_bswap32(hostlong);
++}
++
++uint16_t htons(uint16_t hostshort)
++{
++    return __builtin_bswap16(hostshort);
++}
++
++uint32_t ntohl(uint32_t netlong)
++{
++    return __builtin_bswap32(netlong);
++}
++
++uint16_t ntohs(uint16_t netshort)
++{
++    return __builtin_bswap16(netshort);
++}
+diff --git a/switch/compat/chown.c b/switch/compat/chown.c
+new file mode 100644
+index 00000000..8d4a8fb2
+--- /dev/null
++++ b/switch/compat/chown.c
+@@ -0,0 +1,20 @@
++/* No ownership on the SD card's FAT/exFAT filesystem. */
++
++#include <sys/types.h>
++#include <unistd.h>
++
++int chown(const char *path, uid_t owner, gid_t group)
++{
++    (void)path;
++    (void)owner;
++    (void)group;
++    return 0;
++}
++
++int fchown(int fd, uid_t owner, gid_t group)
++{
++    (void)fd;
++    (void)owner;
++    (void)group;
++    return 0;
++}
+diff --git a/switch/compat/dirname.c b/switch/compat/dirname.c
+new file mode 100644
+index 00000000..e083526c
+--- /dev/null
++++ b/switch/compat/dirname.c
+@@ -0,0 +1,24 @@
++/* POSIX `dirname` (may modify its argument). */
++
++#include <stddef.h>
++
++char *dirname(char *path)
++{
++    static char dot[] = ".";
++    if (!path || !*path)
++        return dot;
++    size_t len = __builtin_strlen(path);
++    while (len > 1 && path[len - 1] == '/')
++        path[--len] = '\0';
++    char *slash = __builtin_strrchr(path, '/');
++    if (!slash)
++        return dot;
++    while (slash > path && slash[-1] == '/')
++        slash--;
++    if (slash == path) {
++        path[1] = '\0';
++        return path;
++    }
++    *slash = '\0';
++    return path;
++}
+diff --git a/switch/compat/entropy.c b/switch/compat/entropy.c
+new file mode 100644
+index 00000000..4905d202
+--- /dev/null
++++ b/switch/compat/entropy.c
+@@ -0,0 +1,24 @@
++/* Backend for newlib's `getentropy` (used by LuaJIT's PRNG seeding, `arc4random`, LibreSSL…). */
++
++#include <errno.h>
++#include <reent.h>
++#include <stddef.h>
++
++#include <switch/types.h>
++#include <switch/result.h>
++#include <switch/kernel/random.h>
++#include <switch/services/csrng.h>
++
++int _getentropy_r(struct _reent *r, void *buf, size_t len)
++{
++    static int csrng_available = -1;
++    if (len > 256) {
++        r->_errno = EIO;
++        return -1;
++    }
++    if (csrng_available < 0)
++        csrng_available = R_SUCCEEDED(csrngInitialize());
++    if (!csrng_available || R_FAILED(csrngGetRandomBytes(buf, len)))
++        randomGet(buf, len);
++    return 0;
++}
+diff --git a/switch/compat/fchdir.c b/switch/compat/fchdir.c
+new file mode 100644
+index 00000000..79b593f2
+--- /dev/null
++++ b/switch/compat/fchdir.c
+@@ -0,0 +1,11 @@
++/* `fchdir` (declared, but not provided by newlib): directories can't be changed through descriptors. */
++
++#include <errno.h>
++#include <unistd.h>
++
++int fchdir(int fd)
++{
++    (void)fd;
++    errno = ENOSYS;
++    return -1;
++}
+diff --git a/switch/compat/fcntl.c b/switch/compat/fcntl.c
+new file mode 100644
+index 00000000..6076b9f6
+--- /dev/null
++++ b/switch/compat/fcntl.c
+@@ -0,0 +1,28 @@
++/*
++    Advisory locks: there is a single process, so pretend they always succeed
++    (e.g. for SQLite). Everything else goes through newlib/libnx.
++    (Wired in with `-Wl,--wrap=fcntl`.)
++*/
++
++#include <fcntl.h>
++#include <stdarg.h>
++
++int __real_fcntl(int fd, int cmd, ...);
++
++int __wrap_fcntl(int fd, int cmd, ...)
++{
++    va_list ap;
++    va_start(ap, cmd);
++    void *arg = va_arg(ap, void *);
++    va_end(ap);
++    switch (cmd) {
++        case F_GETLK:
++            ((struct flock *)arg)->l_type = F_UNLCK;
++            return 0;
++        case F_SETLK:
++        case F_SETLKW:
++            return 0;
++        default:
++            return __real_fcntl(fd, cmd, arg);
++    }
++}
+diff --git a/switch/compat/fdatasync.c b/switch/compat/fdatasync.c
+new file mode 100644
+index 00000000..81692b1b
+--- /dev/null
++++ b/switch/compat/fdatasync.c
+@@ -0,0 +1,8 @@
++/* `fdatasync` (declared, but not provided by newlib): same as `fsync`. */
++
++#include <unistd.h>
++
++int fdatasync(int fd)
++{
++    return fsync(fd);
++}
+diff --git a/switch/compat/getaddrinfo.c b/switch/compat/getaddrinfo.c
+new file mode 100644
+index 00000000..b09b6047
+--- /dev/null
++++ b/switch/compat/getaddrinfo.c
+@@ -0,0 +1,29 @@
++/*
++    getaddrinfo: make sure each result carries a socket type.
++
++    The resolver can return results with `ai_socktype == 0` even when the caller asked for a
++    specific type in the hints. luasocket then does `socket(ai_family, ai_socktype, ai_protocol)`
++    with type 0, which the BSD layer rejects with EPROTOTYPE, so every connection fails. Copy the
++    requested type (default SOCK_STREAM) into any result that came back without one.
++    (Wired in with `-Wl,--wrap=getaddrinfo`.)
++*/
++
++#include <netdb.h>
++#include <sys/socket.h>
++
++int __real_getaddrinfo(const char *node, const char *service,
++                       const struct addrinfo *hints, struct addrinfo **res);
++
++int __wrap_getaddrinfo(const char *node, const char *service,
++                       const struct addrinfo *hints, struct addrinfo **res)
++{
++    int rc = __real_getaddrinfo(node, service, hints, res);
++    if (rc == 0 && res) {
++        int socktype = (hints && hints->ai_socktype) ? hints->ai_socktype : SOCK_STREAM;
++        for (struct addrinfo *ai = *res; ai; ai = ai->ai_next) {
++            if (ai->ai_socktype == 0)
++                ai->ai_socktype = socktype;
++        }
++    }
++    return rc;
++}
+diff --git a/switch/compat/getcwd.c b/switch/compat/getcwd.c
+new file mode 100644
+index 00000000..9c7e31e1
+--- /dev/null
++++ b/switch/compat/getcwd.c
+@@ -0,0 +1,17 @@
++/*
++    `getcwd` returns paths prefixed with the device name (e.g. `sdmc:/switch/koreader`),
++    which the frontend does not expect. Since `sdmc` is the default device, strip it.
++    (Wired in with `-Wl,--wrap=getcwd`.)
++*/
++
++#include <stddef.h>
++
++char *__real_getcwd(char *buf, size_t size);
++
++char *__wrap_getcwd(char *buf, size_t size)
++{
++    char *cwd = __real_getcwd(buf, size);
++    if (cwd && __builtin_strncmp(cwd, "sdmc:/", 6) == 0)
++        __builtin_memmove(cwd, cwd + 5, __builtin_strlen(cwd + 5) + 1);
++    return cwd;
++}
+diff --git a/switch/compat/ids.c b/switch/compat/ids.c
+new file mode 100644
+index 00000000..e614143a
+--- /dev/null
++++ b/switch/compat/ids.c
+@@ -0,0 +1,9 @@
++/* There's a single (all powerful) user. */
++
++#include <sys/types.h>
++#include <unistd.h>
++
++uid_t getuid(void) { return 0; }
++uid_t geteuid(void) { return 0; }
++gid_t getgid(void) { return 0; }
++gid_t getegid(void) { return 0; }
+diff --git a/switch/compat/if_nametoindex.c b/switch/compat/if_nametoindex.c
+new file mode 100644
+index 00000000..738a52cc
+--- /dev/null
++++ b/switch/compat/if_nametoindex.c
+@@ -0,0 +1,19 @@
++/* Network interfaces are managed by the system: there's no name ↔ index mapping. */
++
++#include <errno.h>
++#include <stddef.h>
++
++unsigned int if_nametoindex(const char *ifname)
++{
++    (void)ifname;
++    errno = ENXIO;
++    return 0;
++}
++
++char *if_indextoname(unsigned int ifindex, char *ifname)
++{
++    (void)ifindex;
++    (void)ifname;
++    errno = ENXIO;
++    return NULL;
++}
+diff --git a/switch/compat/mman.c b/switch/compat/mman.c
+new file mode 100644
+index 00000000..8d07640e
+--- /dev/null
++++ b/switch/compat/mman.c
+@@ -0,0 +1,70 @@
++/*
++    Memory mappings: there is no mmap for homebrew. Anonymous mappings are
++    emulated with page-aligned allocations (since there's a single process,
++    shared ones are no different), anything else fails with ENOSYS.
++*/
++
++#include <errno.h>
++#include <malloc.h>
++#include <stdlib.h>
++#include <sys/mman.h>
++
++void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset)
++{
++    (void)addr;
++    (void)prot;
++    (void)offset;
++    (void)fd;
++    if (!(flags & MAP_ANONYMOUS) || length == 0) {
++        errno = ENOSYS;
++        return MAP_FAILED;
++    }
++    void *p = memalign(4096, length);
++    if (!p) {
++        errno = ENOMEM;
++        return MAP_FAILED;
++    }
++    __builtin_memset(p, 0, length);
++    return p;
++}
++
++int munmap(void *addr, size_t length)
++{
++    (void)length;
++    free(addr);
++    return 0;
++}
++
++int mprotect(void *addr, size_t length, int prot)
++{
++    (void)addr;
++    (void)length;
++    (void)prot;
++    return 0;
++}
++
++int msync(void *addr, size_t length, int flags)
++{
++    (void)addr;
++    (void)length;
++    (void)flags;
++    return 0;
++}
++
++int madvise(void *addr, size_t length, int advice)
++{
++    (void)addr;
++    (void)length;
++    (void)advice;
++    return 0;
++}
++
++void *mremap(void *old_address, size_t old_size, size_t new_size, int flags, ...)
++{
++    (void)old_address;
++    (void)old_size;
++    (void)new_size;
++    (void)flags;
++    errno = ENOSYS;
++    return MAP_FAILED;
++}
+diff --git a/switch/compat/posix_memalign.c b/switch/compat/posix_memalign.c
+new file mode 100644
+index 00000000..1e9b44e4
+--- /dev/null
++++ b/switch/compat/posix_memalign.c
+@@ -0,0 +1,16 @@
++/* `posix_memalign` (not provided by newlib). */
++
++#include <errno.h>
++#include <malloc.h>
++#include <stdlib.h>
++
++int posix_memalign(void **memptr, size_t alignment, size_t size)
++{
++    if (alignment < sizeof(void *) || (alignment & (alignment - 1)))
++        return EINVAL;
++    void *p = memalign(alignment, size);
++    if (!p)
++        return ENOMEM;
++    *memptr = p;
++    return 0;
++}
+diff --git a/switch/compat/pread.c b/switch/compat/pread.c
+new file mode 100644
+index 00000000..ba04b958
+--- /dev/null
++++ b/switch/compat/pread.c
+@@ -0,0 +1,29 @@
++/* `pread` / `pwrite`, emulated with `lseek`. */
++
++#include <errno.h>
++#include <sys/types.h>
++#include <unistd.h>
++
++ssize_t pread(int fd, void *buf, size_t count, off_t offset)
++{
++    off_t saved = lseek(fd, 0, SEEK_CUR);
++    if (saved < 0 || lseek(fd, offset, SEEK_SET) < 0)
++        return -1;
++    ssize_t ret = read(fd, buf, count);
++    int saved_errno = errno;
++    lseek(fd, saved, SEEK_SET);
++    errno = saved_errno;
++    return ret;
++}
++
++ssize_t pwrite(int fd, const void *buf, size_t count, off_t offset)
++{
++    off_t saved = lseek(fd, 0, SEEK_CUR);
++    if (saved < 0 || lseek(fd, offset, SEEK_SET) < 0)
++        return -1;
++    ssize_t ret = write(fd, buf, count);
++    int saved_errno = errno;
++    lseek(fd, saved, SEEK_SET);
++    errno = saved_errno;
++    return ret;
++}
+diff --git a/switch/compat/pwd.c b/switch/compat/pwd.c
+new file mode 100644
+index 00000000..ef6f7d36
+--- /dev/null
++++ b/switch/compat/pwd.c
+@@ -0,0 +1,20 @@
++/* There's no user database. */
++
++#include <errno.h>
++#include <pwd.h>
++#include <stddef.h>
++#include <sys/types.h>
++
++struct passwd *getpwnam(const char *name)
++{
++    (void)name;
++    errno = ENOENT;
++    return NULL;
++}
++
++struct passwd *getpwuid(uid_t uid)
++{
++    (void)uid;
++    errno = ENOENT;
++    return NULL;
++}
+diff --git a/switch/compat/readv.c b/switch/compat/readv.c
+new file mode 100644
+index 00000000..749ee2a5
+--- /dev/null
++++ b/switch/compat/readv.c
+@@ -0,0 +1,32 @@
++/* `readv` / `writev`, emulated with `read` / `write`. */
++
++#include <sys/uio.h>
++#include <unistd.h>
++
++ssize_t readv(int fd, const struct iovec *iov, int iovcnt)
++{
++    ssize_t total = 0;
++    for (int i = 0; i < iovcnt; i++) {
++        ssize_t n = read(fd, iov[i].iov_base, iov[i].iov_len);
++        if (n < 0)
++            return total ? total : -1;
++        total += n;
++        if ((size_t)n < iov[i].iov_len)
++            break;
++    }
++    return total;
++}
++
++ssize_t writev(int fd, const struct iovec *iov, int iovcnt)
++{
++    ssize_t total = 0;
++    for (int i = 0; i < iovcnt; i++) {
++        ssize_t n = write(fd, iov[i].iov_base, iov[i].iov_len);
++        if (n < 0)
++            return total ? total : -1;
++        total += n;
++        if ((size_t)n < iov[i].iov_len)
++            break;
++    }
++    return total;
++}
+diff --git a/switch/compat/rmdir.c b/switch/compat/rmdir.c
+new file mode 100644
+index 00000000..bef2dd15
+--- /dev/null
++++ b/switch/compat/rmdir.c
+@@ -0,0 +1,34 @@
++/*
++    Directory removal: refuse a non-empty directory ourselves (returning ENOTEMPTY) instead of
++    asking the filesystem to remove it. Horizon returns an error for a non-empty directory anyway,
++    but doing the check here also keeps emulators whose host-backed filesystem aborts, instead of
++    returning that error, from crashing.
++
++    We wrap newlib's reentrant `_rmdir_r`, which is the single chokepoint: the public `rmdir()`
++    calls it, and so does `remove()` (hence `os.remove(dir)`) once `unlink` fails on a directory.
++    (Wired in with `-Wl,--wrap=_rmdir_r`.)
++*/
++
++#include <dirent.h>
++#include <errno.h>
++#include <reent.h>
++#include <string.h>
++
++int __real__rmdir_r(struct _reent *r, const char *path);
++
++int __wrap__rmdir_r(struct _reent *r, const char *path)
++{
++    DIR *d = opendir(path);
++    if (d) {
++        struct dirent *e;
++        while ((e = readdir(d)) != NULL) {
++            if (strcmp(e->d_name, ".") != 0 && strcmp(e->d_name, "..") != 0) {
++                closedir(d);
++                r->_errno = ENOTEMPTY;
++                return -1;
++            }
++        }
++        closedir(d);
++    }
++    return __real__rmdir_r(r, path);
++}
+diff --git a/switch/compat/sigaction.c b/switch/compat/sigaction.c
+new file mode 100644
+index 00000000..c3e120e1
+--- /dev/null
++++ b/switch/compat/sigaction.c
+@@ -0,0 +1,13 @@
++/* `sigaction` (declared, but not provided by newlib): there are no signals to handle. */
++
++#include <signal.h>
++#include <string.h>
++
++int sigaction(int sig, const struct sigaction *act, struct sigaction *oact)
++{
++    (void)sig;
++    (void)act;
++    if (oact)
++        memset(oact, 0, sizeof(*oact));
++    return 0;
++}
+diff --git a/switch/compat/sysconf.c b/switch/compat/sysconf.c
+new file mode 100644
+index 00000000..e71445cc
+--- /dev/null
++++ b/switch/compat/sysconf.c
+@@ -0,0 +1,21 @@
++/* `sysconf` (not provided by newlib). */
++
++#include <errno.h>
++#include <unistd.h>
++
++long sysconf(int name)
++{
++    switch (name) {
++        case _SC_PAGESIZE:
++            return 4096;
++        case _SC_NPROCESSORS_CONF:
++        case _SC_NPROCESSORS_ONLN:
++            /* Core 3 is reserved for the system. */
++            return 3;
++        case _SC_OPEN_MAX:
++            return 256;
++        default:
++            errno = EINVAL;
++            return -1;
++    }
++}
+diff --git a/switch/compat/syslog.c b/switch/compat/syslog.c
+new file mode 100644
+index 00000000..bd8b8397
+--- /dev/null
++++ b/switch/compat/syslog.c
+@@ -0,0 +1,34 @@
++/* No system logger: syslog is a no-op. */
++
++#include <stdarg.h>
++#include <syslog.h>
++
++void openlog(const char *ident, int option, int facility)
++{
++    (void)ident;
++    (void)option;
++    (void)facility;
++}
++
++void vsyslog(int priority, const char *format, va_list ap)
++{
++    (void)priority;
++    (void)format;
++    (void)ap;
++}
++
++void syslog(int priority, const char *format, ...)
++{
++    (void)priority;
++    (void)format;
++}
++
++void closelog(void)
++{
++}
++
++int setlogmask(int mask)
++{
++    (void)mask;
++    return 0xff;
++}
+diff --git a/switch/compat/termios.c b/switch/compat/termios.c
+new file mode 100644
+index 00000000..bfe2a73b
+--- /dev/null
++++ b/switch/compat/termios.c
+@@ -0,0 +1,67 @@
++/* There are no terminals. */
++
++#include <errno.h>
++#include <termios.h>
++
++int tcgetattr(int fd, struct termios *termios_p)
++{
++    (void)fd;
++    (void)termios_p;
++    errno = ENOTTY;
++    return -1;
++}
++
++int tcsetattr(int fd, int optional_actions, const struct termios *termios_p)
++{
++    (void)fd;
++    (void)optional_actions;
++    (void)termios_p;
++    errno = ENOTTY;
++    return -1;
++}
++
++int tcflush(int fd, int queue_selector)
++{
++    (void)fd;
++    (void)queue_selector;
++    errno = ENOTTY;
++    return -1;
++}
++
++int tcdrain(int fd)
++{
++    (void)fd;
++    errno = ENOTTY;
++    return -1;
++}
++
++speed_t cfgetispeed(const struct termios *termios_p)
++{
++    return termios_p->c_ispeed;
++}
++
++speed_t cfgetospeed(const struct termios *termios_p)
++{
++    return termios_p->c_ospeed;
++}
++
++int cfsetispeed(struct termios *termios_p, speed_t speed)
++{
++    termios_p->c_ispeed = speed;
++    return 0;
++}
++
++int cfsetospeed(struct termios *termios_p, speed_t speed)
++{
++    termios_p->c_ospeed = speed;
++    return 0;
++}
++
++void cfmakeraw(struct termios *termios_p)
++{
++    termios_p->c_iflag &= ~(IGNBRK | BRKINT | PARMRK | ISTRIP | INLCR | IGNCR | ICRNL | IXON);
++    termios_p->c_oflag &= ~OPOST;
++    termios_p->c_lflag &= ~(ECHO | ECHONL | ICANON | ISIG | IEXTEN);
++    termios_p->c_cflag &= ~(CSIZE | PARENB);
++    termios_p->c_cflag |= CS8;
++}
+diff --git a/switch/compat/timegm.c b/switch/compat/timegm.c
+new file mode 100644
+index 00000000..96a0843e
+--- /dev/null
++++ b/switch/compat/timegm.c
+@@ -0,0 +1,21 @@
++/* `timegm` (not provided by newlib). */
++
++#include <time.h>
++
++time_t timegm(struct tm *tm)
++{
++    /* Days since the epoch, c.f. http://howardhinnant.github.io/date_algorithms.html#days_from_civil */
++    long long year = (long long)tm->tm_year + 1900 + tm->tm_mon / 12;
++    int month = tm->tm_mon % 12;
++    if (month < 0) {
++        month += 12;
++        year--;
++    }
++    year -= month < 2;
++    long long era = (year >= 0 ? year : year - 399) / 400;
++    long long yoe = year - era * 400;
++    long long doy = (153 * (month + (month > 1 ? -2 : 10)) + 2) / 5 + tm->tm_mday - 1;
++    long long doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
++    long long days = era * 146097 + doe - 719468;
++    return (time_t)(days * 86400 + tm->tm_hour * 3600LL + tm->tm_min * 60LL + tm->tm_sec);
++}
+diff --git a/switch/compat/umask.c b/switch/compat/umask.c
+new file mode 100644
+index 00000000..38002d8f
+--- /dev/null
++++ b/switch/compat/umask.c
+@@ -0,0 +1,10 @@
++/* No permissions on the SD card's FAT/exFAT filesystem. */
++
++#include <sys/stat.h>
++#include <sys/types.h>
++
++mode_t umask(mode_t mask)
++{
++    (void)mask;
++    return 022;
++}
+diff --git a/switch/compat/waitpid.c b/switch/compat/waitpid.c
+new file mode 100644
+index 00000000..b477bd04
+--- /dev/null
++++ b/switch/compat/waitpid.c
+@@ -0,0 +1,14 @@
++/* `waitpid` (declared, but not provided by newlib): there are no child processes. */
++
++#include <errno.h>
++#include <sys/types.h>
++#include <sys/wait.h>
++
++pid_t waitpid(pid_t pid, int *status, int options)
++{
++    (void)pid;
++    (void)status;
++    (void)options;
++    errno = ECHILD;
++    return -1;
++}
+diff --git a/switch/device.c b/switch/device.c
+new file mode 100644
+index 00000000..4b77b4af
+--- /dev/null
++++ b/switch/device.c
+@@ -0,0 +1,139 @@
++/*
++    KOReader for Nintendo Switch: display & device services.
++*/
++
++#include <switch.h>
++
++#include <string.h>
++
++#include "koswitch.h"
++
++/* -- Framebuffer ------------------------------------------------------------ */
++
++static Framebuffer g_fb;
++static bool g_fb_ready;
++
++int ko_fb_init(void)
++{
++    if (g_fb_ready)
++        return 0;
++    Result rc = framebufferCreate(&g_fb, nwindowGetDefault(), KO_FB_WIDTH, KO_FB_HEIGHT, PIXEL_FORMAT_RGBA_8888, 2);
++    if (R_FAILED(rc))
++        return -1;
++    /* The GPU buffers are laid out in block-linear order: draw into a linear shadow buffer, which libnx converts. */
++    if (R_FAILED(framebufferMakeLinear(&g_fb))) {
++        framebufferClose(&g_fb);
++        return -1;
++    }
++    g_fb_ready = true;
++    return 0;
++}
++
++void ko_fb_close(void)
++{
++    if (g_fb_ready) {
++        framebufferClose(&g_fb);
++        g_fb_ready = false;
++    }
++}
++
++/*
++    Present a full frame. `pixels` points to a 1280x720 RGBA8888 buffer (i.e., KOReader's
++    BBRGB32 layout) laid out in the panel's native (landscape) orientation, `stride` is in
++    pixels (the shadow buffer's is in bytes). Rotation is handled by the blitbuffer itself,
++    inversion (night mode) here.
++*/
++__attribute__((optimize("O3")))
++void ko_fb_present(const uint8_t *pixels, int stride, int invert)
++{
++    if (!g_fb_ready || !pixels)
++        return;
++    u32 dst_stride;
++    uint8_t *dst = framebufferBegin(&g_fb, &dst_stride);
++    const u32 mask = invert ? 0x00ffffffu : 0;
++    const u32 alpha = 0xff000000u;
++    for (int y = 0; y < KO_FB_HEIGHT; y++) {
++        const uint8_t *s = pixels + (size_t)y * (size_t)stride * 4;
++        uint8_t *d = dst + (size_t)y * dst_stride;
++        for (int x = 0; x < KO_FB_WIDTH * 4; x += 4) {
++            u32 v;
++            memcpy(&v, s + x, 4);
++            v = (v ^ mask) | alpha;
++            memcpy(d + x, &v, 4);
++        }
++    }
++    framebufferEnd(&g_fb);
++}
++
++/* -- Device ----------------------------------------------------------------- */
++
++int ko_get_product_model(void)
++{
++    SetSysProductModel model = SetSysProductModel_Invalid;
++    if (R_SUCCEEDED(setsysInitialize())) {
++        if (R_FAILED(setsysGetProductModel(&model)))
++            model = SetSysProductModel_Invalid;
++        setsysExit();
++    }
++    return model;
++}
++
++int ko_is_applet_mode(void)
++{
++    AppletType type = appletGetAppletType();
++    return type != AppletType_Application && type != AppletType_SystemApplication;
++}
++
++int ko_get_operation_mode(void)
++{
++    return appletGetOperationMode();
++}
++
++int ko_get_battery_percentage(void)
++{
++    u32 percentage;
++    if (R_FAILED(psmGetBatteryChargePercentage(&percentage)))
++        return -1;
++    return percentage;
++}
++
++int ko_is_charging(void)
++{
++    PsmChargerType type;
++    if (R_FAILED(psmGetChargerType(&type)))
++        return 0;
++    return type != PsmChargerType_Unconnected;
++}
++
++float ko_get_brightness(void)
++{
++    float value;
++    if (R_FAILED(lblGetCurrentBrightnessSetting(&value)))
++        return -1.0f;
++    return value;
++}
++
++int ko_set_brightness(float value)
++{
++    if (value < 0.0f)
++        value = 0.0f;
++    if (value > 1.0f)
++        value = 1.0f;
++    return R_SUCCEEDED(lblSetCurrentBrightnessSetting(value)) ? 0 : -1;
++}
++
++int ko_is_network_connected(void)
++{
++    NifmInternetConnectionType type;
++    NifmInternetConnectionStatus status;
++    u32 strength;
++    if (R_FAILED(nifmGetInternetConnectionStatus(&type, &strength, &status)))
++        return 0;
++    return status == NifmInternetConnectionStatus_Connected;
++}
++
++void ko_set_auto_sleep_inhibited(int inhibited)
++{
++    /* Same as video players: prevents screen dimming & auto-sleep while reading. */
++    appletSetMediaPlaybackState(inhibited != 0);
++}
+diff --git a/switch/gen_symtab.py b/switch/gen_symtab.py
+new file mode 100644
+index 00000000..47e361e9
+--- /dev/null
++++ b/switch/gen_symtab.py
+@@ -0,0 +1,159 @@
++#!/usr/bin/env python3
++"""
++Linker launcher for the Nintendo Switch executable.
++
++There is no dynamic loader on Horizon, so everything is statically linked,
++and LuaJIT's FFI (`ffi.C.xxx`, `ffi.load(…)`) as well as `require` of Lua C
++modules resolve their symbols through a table generated here:
++
++1. collect candidate symbols from the ffi-cdecl files (`cdecl_func(…)` and
++   `cdecl_var(…)` entries), plus some extra lists;
++2. keep only the ones actually defined by the link inputs (objects, static
++   libraries, and the toolchain's default libraries);
++3. compile the table, and add it to the link command, which is then run.
++
++Usage:
++    gen_symtab.py --nm NM --cdecls FILE[;FILE…] -- LINK_COMMAND…
++"""
++
++import argparse
++import os
++import re
++import shlex
++import subprocess
++import sys
++
++
++CDECL_RX = re.compile(r'^\s*cdecl_(?:func|var)\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*\)', re.M)
++
++TOOLCHAIN_LIBS = (
++    'libc.a', 'libg.a', 'libm.a', 'libsysbase.a', 'libpthread.a',
++    'libstdc++.a', 'libsupc++.a', 'libgcc.a',
++)
++
++
++def expand_response_files(args):
++    out = []
++    for a in args:
++        if a.startswith('@') and os.path.isfile(a[1:]):
++            with open(a[1:]) as fp:
++                out.extend(expand_response_files(shlex.split(fp.read())))
++        else:
++            out.append(a)
++    return out
++
++
++def find_compiler(cmd):
++    for a in cmd:
++        base = os.path.basename(a)
++        if base.endswith(('gcc', 'g++', 'cc', 'c++')) and 'ccache' not in base:
++            return a
++    raise SystemExit('gen_symtab: cannot find compiler in link command')
++
++
++def link_inputs(cmd):
++    files, libdirs, libnames = [], [], []
++    it = iter(cmd)
++    for a in it:
++        if a == '-o':
++            next(it, None)
++        elif a.startswith('-L'):
++            libdirs.append(a[2:] or next(it, ''))
++        elif a.startswith('-l') and not a.startswith('-l:'):
++            libnames.append(a[2:])
++        elif a.endswith(('.a', '.o', '.obj')) and os.path.isfile(a):
++            files.append(a)
++    for name in libnames:
++        for d in libdirs:
++            p = os.path.join(d, 'lib%s.a' % name)
++            if os.path.isfile(p):
++                files.append(p)
++                break
++    return files
++
++
++def toolchain_libs(cc, cmd):
++    # Use the same multilib selection flags as the link.
++    flags = [a for a in cmd if a.startswith(('-m', '-specs=', '-fPIC', '-fpic', '-fPIE', '-fpie'))]
++    libs = []
++    for name in TOOLCHAIN_LIBS:
++        path = subprocess.check_output([cc] + flags + ['-print-file-name=' + name], text=True).strip()
++        if os.path.isabs(path) and os.path.isfile(path):
++            libs.append(path)
++    devkitpro = os.environ.get('DEVKITPRO')
++    if devkitpro:
++        libnx = os.path.join(devkitpro, 'libnx', 'lib', 'libnx.a')
++        if os.path.isfile(libnx):
++            libs.append(libnx)
++    return libs
++
++
++def defined_symbols(nm, files):
++    symbols = set()
++    for chunk in range(0, len(files), 64):
++        out = subprocess.run(
++            [nm, '-g', '--defined-only', '-P'] + files[chunk:chunk + 64],
++            check=True, capture_output=True, text=True,
++        ).stdout
++        for line in out.splitlines():
++            fields = line.split()
++            if len(fields) >= 2 and len(fields[1]) == 1 and fields[1] not in 'Uw':
++                symbols.add(fields[0])
++    return symbols
++
++
++def main():
++    argv = sys.argv[1:]
++    if '--' not in argv:
++        raise SystemExit(__doc__)
++    split = argv.index('--')
++    parser = argparse.ArgumentParser()
++    parser.add_argument('--nm', required=True)
++    parser.add_argument('--cdecls', required=True)
++    parser.add_argument('--output', required=True)
++    # Libraries linked implicitly (e.g. through a specs file).
++    parser.add_argument('--extra-lib', action='append', default=[])
++    opts = parser.parse_args(argv[:split])
++    cmd = argv[split + 1:]
++    link_cmd = expand_response_files(cmd)
++
++    candidates = set()
++    with open(opts.cdecls, encoding='utf-8') as fp:
++        cdecl_files = [line.strip() for line in fp if line.strip()]
++    for f in cdecl_files:
++        with open(f, encoding='utf-8') as fp:
++            candidates.update(CDECL_RX.findall(fp.read()))
++
++    cc = find_compiler(link_cmd)
++    files = link_inputs(link_cmd) + toolchain_libs(cc, link_cmd) + [f for f in opts.extra_lib if os.path.isfile(f)]
++    defined = defined_symbols(opts.nm, files)
++    symbols = sorted(candidates & defined)
++
++    src = opts.output
++    obj = os.path.splitext(src)[0] + '.o'
++    with open(src, 'w') as fp:
++        fp.write('/* Generated by gen_symtab.py: do not edit. */\n\n')
++        fp.write('#include <stddef.h>\n\n')
++        fp.write('typedef struct { const char *name; void *addr; } ko_symbol;\n\n')
++        for n, s in enumerate(symbols):
++            fp.write('extern char ko_sym_%u __asm__("%s");\n' % (n, s))
++        fp.write('\nconst ko_symbol ko_symtab[] = {\n')
++        for n, s in enumerate(symbols):
++            fp.write('    { "%s", &ko_sym_%u },\n' % (s, n))
++        fp.write('};\n\nconst size_t ko_symtab_size = %u;\n' % len(symbols))
++    compile_flags = [a for a in link_cmd if a.startswith(('-m', '-fPIC', '-fpic', '-fPIE', '-fpie'))]
++    # NOTE: the link driver may be `g++`, which would compile the table as C++ (mangled, internal linkage).
++    subprocess.run([cc, '-x', 'c'] + compile_flags + ['-fno-builtin', '-w', '-c', src, '-o', obj], check=True)
++    missing = sorted(candidates - defined)
++    with open(os.path.splitext(src)[0] + '.missing', 'w') as fp:
++        fp.write('\n'.join(missing) + '\n')
++    print('gen_symtab: %u symbols (%u declared but not linked)' % (len(symbols), len(missing)))
++
++    # Insert the table object before the first library, so its references pull archive members.
++    pos = next((i for i, a in enumerate(cmd) if a.endswith('.a') or a.startswith(('-l', '-Wl,--start-group'))), len(cmd))
++    cmd = cmd[:pos] + [obj] + cmd[pos:]
++    os.execvp(cmd[0], cmd)
++
++
++if __name__ == '__main__':
++    main()
+diff --git a/switch/include/byteswap.h b/switch/include/byteswap.h
+new file mode 100644
+index 00000000..3cfa66ee
+--- /dev/null
++++ b/switch/include/byteswap.h
+@@ -0,0 +1,10 @@
++/* KOReader for Nintendo Switch: <byteswap.h> (glibc extension). */
++
++#ifndef KOSWITCH_BYTESWAP_H
++#define KOSWITCH_BYTESWAP_H
++
++#define bswap_16(x) __builtin_bswap16(x)
++#define bswap_32(x) __builtin_bswap32(x)
++#define bswap_64(x) __builtin_bswap64(x)
++
++#endif
+diff --git a/switch/include/endian.h b/switch/include/endian.h
+new file mode 100644
+index 00000000..d442a667
+--- /dev/null
++++ b/switch/include/endian.h
+@@ -0,0 +1,48 @@
++/* KOReader for Nintendo Switch: <endian.h> (newlib only provides <machine/endian.h>). */
++
++#ifndef KOSWITCH_ENDIAN_H
++#define KOSWITCH_ENDIAN_H
++
++#include <machine/endian.h>
++
++#ifndef LITTLE_ENDIAN
++# define LITTLE_ENDIAN _LITTLE_ENDIAN
++#endif
++#ifndef BIG_ENDIAN
++# define BIG_ENDIAN _BIG_ENDIAN
++#endif
++#ifndef PDP_ENDIAN
++# define PDP_ENDIAN _PDP_ENDIAN
++#endif
++#ifndef BYTE_ORDER
++# define BYTE_ORDER _BYTE_ORDER
++#endif
++
++#if _BYTE_ORDER == _LITTLE_ENDIAN
++# define KOSWITCH_TO_LE(bits, x) ((__uint##bits##_t)(x))
++# define KOSWITCH_TO_BE(bits, x) __builtin_bswap##bits(x)
++#else
++# define KOSWITCH_TO_LE(bits, x) __builtin_bswap##bits(x)
++# define KOSWITCH_TO_BE(bits, x) ((__uint##bits##_t)(x))
++#endif
++
++#ifndef htobe16
++# define htobe16(x) KOSWITCH_TO_BE(16, x)
++# define htole16(x) KOSWITCH_TO_LE(16, x)
++# define be16toh(x) KOSWITCH_TO_BE(16, x)
++# define le16toh(x) KOSWITCH_TO_LE(16, x)
++#endif
++#ifndef htobe32
++# define htobe32(x) KOSWITCH_TO_BE(32, x)
++# define htole32(x) KOSWITCH_TO_LE(32, x)
++# define be32toh(x) KOSWITCH_TO_BE(32, x)
++# define le32toh(x) KOSWITCH_TO_LE(32, x)
++#endif
++#ifndef htobe64
++# define htobe64(x) KOSWITCH_TO_BE(64, x)
++# define htole64(x) KOSWITCH_TO_LE(64, x)
++# define be64toh(x) KOSWITCH_TO_BE(64, x)
++# define le64toh(x) KOSWITCH_TO_LE(64, x)
++#endif
++
++#endif
+diff --git a/switch/include/netinet/in.h b/switch/include/netinet/in.h
+new file mode 100644
+index 00000000..b359507a
+--- /dev/null
++++ b/switch/include/netinet/in.h
+@@ -0,0 +1,31 @@
++/*
++    KOReader for Nintendo Switch: libnx's <netinet/in.h>, plus:
++    - the byte order functions (`htons` & co), which libnx only provides in <arpa/inet.h>,
++      while other C libraries also make them available here;
++    - a few missing IPv6 bits.
++*/
++
++#ifndef KOSWITCH_NETINET_IN_H
++#define KOSWITCH_NETINET_IN_H
++
++#include_next <netinet/in.h>
++#include <arpa/inet.h>
++
++/* NOTE: `struct in6_addr` wraps an (anonymous) union whose first member is `uint16_t[8]`. */
++#ifndef IN6ADDR_ANY_INIT
++# define IN6ADDR_ANY_INIT { { { 0, 0, 0, 0, 0, 0, 0, 0 } } }
++#endif
++#ifndef IN6ADDR_LOOPBACK_INIT
++# if _BYTE_ORDER == _LITTLE_ENDIAN
++#  define IN6ADDR_LOOPBACK_INIT { { { 0, 0, 0, 0, 0, 0, 0, 0x0100 } } }
++# else
++#  define IN6ADDR_LOOPBACK_INIT { { { 0, 0, 0, 0, 0, 0, 0, 0x0001 } } }
++# endif
++#endif
++
++struct ipv6_mreq {
++    struct in6_addr ipv6mr_multiaddr;
++    unsigned int ipv6mr_interface;
++};
++
++#endif
+diff --git a/switch/include/sys/mman.h b/switch/include/sys/mman.h
+new file mode 100644
+index 00000000..e8cc9a8a
+--- /dev/null
++++ b/switch/include/sys/mman.h
+@@ -0,0 +1,51 @@
++/*
++    KOReader for Nintendo Switch: <sys/mman.h>.
++
++    There is no mmap on Horizon (for homebrew): anonymous private mappings are
++    emulated with aligned allocations, everything else fails with ENOSYS
++    (c.f., `switch/compat.c`).
++*/
++
++#ifndef KOSWITCH_SYS_MMAN_H
++#define KOSWITCH_SYS_MMAN_H
++
++#include <sys/types.h>
++
++#define PROT_NONE  0x0
++#define PROT_READ  0x1
++#define PROT_WRITE 0x2
++#define PROT_EXEC  0x4
++
++#define MAP_SHARED    0x01
++#define MAP_PRIVATE   0x02
++#define MAP_FIXED     0x10
++#define MAP_ANONYMOUS 0x20
++#define MAP_ANON      MAP_ANONYMOUS
++#define MAP_NORESERVE 0x4000
++
++#define MAP_FAILED ((void *)-1)
++
++#define MS_ASYNC      1
++#define MS_INVALIDATE 2
++#define MS_SYNC       4
++
++#define MADV_NORMAL   0
++#define MADV_RANDOM   1
++#define MADV_WILLNEED 3
++#define MADV_DONTNEED 4
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset);
++int munmap(void *addr, size_t length);
++int mprotect(void *addr, size_t length, int prot);
++int msync(void *addr, size_t length, int flags);
++int madvise(void *addr, size_t length, int advice);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif
+diff --git a/switch/include/sys/termios.h b/switch/include/sys/termios.h
+new file mode 100644
+index 00000000..22cc5b49
+--- /dev/null
++++ b/switch/include/sys/termios.h
+@@ -0,0 +1,119 @@
++/*
++    KOReader for Nintendo Switch: <sys/termios.h> (included by newlib's <termios.h>).
++    There are no terminals: the functions fail with ENOTTY (c.f., `switch/compat/termios.c`).
++*/
++
++#ifndef KOSWITCH_SYS_TERMIOS_H
++#define KOSWITCH_SYS_TERMIOS_H
++
++#include <sys/types.h>
++
++typedef unsigned int tcflag_t;
++typedef unsigned char cc_t;
++typedef unsigned int speed_t;
++
++#define NCCS 32
++
++struct termios {
++    tcflag_t c_iflag;
++    tcflag_t c_oflag;
++    tcflag_t c_cflag;
++    tcflag_t c_lflag;
++    cc_t c_line;
++    cc_t c_cc[NCCS];
++    speed_t c_ispeed;
++    speed_t c_ospeed;
++};
++
++/* c_cc indexes. */
++#define VINTR    0
++#define VQUIT    1
++#define VERASE   2
++#define VKILL    3
++#define VEOF     4
++#define VTIME    5
++#define VMIN     6
++#define VSTART   8
++#define VSTOP    9
++#define VSUSP    10
++#define VEOL     11
++
++/* c_iflag. */
++#define IGNBRK  0000001
++#define BRKINT  0000002
++#define IGNPAR  0000004
++#define PARMRK  0000010
++#define INPCK   0000020
++#define ISTRIP  0000040
++#define INLCR   0000100
++#define IGNCR   0000200
++#define ICRNL   0000400
++#define IXON    0002000
++#define IXANY   0004000
++#define IXOFF   0010000
++
++/* c_oflag. */
++#define OPOST   0000001
++#define ONLCR   0000004
++
++/* c_cflag. */
++#define CSIZE   0000060
++#define CS5     0000000
++#define CS6     0000020
++#define CS7     0000040
++#define CS8     0000060
++#define CSTOPB  0000100
++#define CREAD   0000200
++#define PARENB  0000400
++#define PARODD  0001000
++#define HUPCL   0002000
++#define CLOCAL  0004000
++
++/* c_lflag. */
++#define ISIG    0000001
++#define ICANON  0000002
++#define ECHO    0000010
++#define ECHOE   0000020
++#define ECHOK   0000040
++#define ECHONL  0000100
++#define NOFLSH  0000200
++#define TOSTOP  0000400
++#define IEXTEN  0100000
++
++/* Baud rates. */
++#define B0      0000000
++#define B9600   0000015
++#define B19200  0000016
++#define B38400  0000017
++#define B57600  0010001
++#define B115200 0010002
++
++/* tcsetattr. */
++#define TCSANOW   0
++#define TCSADRAIN 1
++#define TCSAFLUSH 2
++
++/* tcflush. */
++#define TCIFLUSH  0
++#define TCOFLUSH  1
++#define TCIOFLUSH 2
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++int tcgetattr(int fd, struct termios *termios_p);
++int tcsetattr(int fd, int optional_actions, const struct termios *termios_p);
++int tcflush(int fd, int queue_selector);
++int tcdrain(int fd);
++speed_t cfgetispeed(const struct termios *termios_p);
++speed_t cfgetospeed(const struct termios *termios_p);
++int cfsetispeed(struct termios *termios_p, speed_t speed);
++int cfsetospeed(struct termios *termios_p, speed_t speed);
++void cfmakeraw(struct termios *termios_p);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif
+diff --git a/switch/include/sys/types.h b/switch/include/sys/types.h
+new file mode 100644
+index 00000000..2b779e2b
+--- /dev/null
++++ b/switch/include/sys/types.h
+@@ -0,0 +1,9 @@
++/* KOReader for Nintendo Switch: newlib's <sys/types.h>. */
++
++#include_next <sys/types.h>
++
++/*
++    newlib's BSD compatibility `#define quad quad_t` breaks any code using `quad`
++    as an identifier (e.g. MuPDF's `fz_stext_char.quad`). Nothing needs it.
++*/
++#undef quad
+diff --git a/switch/include/sys/uio.h b/switch/include/sys/uio.h
+new file mode 100644
+index 00000000..cd489526
+--- /dev/null
++++ b/switch/include/sys/uio.h
+@@ -0,0 +1,27 @@
++/* KOReader for Nintendo Switch: <sys/uio.h> (implemented in `switch/compat.c`). */
++
++#ifndef KOSWITCH_SYS_UIO_H
++#define KOSWITCH_SYS_UIO_H
++
++#include <sys/types.h>
++#include <sys/_iovec.h>
++
++#ifndef IOV_MAX
++# define IOV_MAX 1024
++#endif
++#ifndef UIO_MAXIOV
++# define UIO_MAXIOV IOV_MAX
++#endif
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++ssize_t readv(int fd, const struct iovec *iov, int iovcnt);
++ssize_t writev(int fd, const struct iovec *iov, int iovcnt);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif
+diff --git a/switch/include/syslog.h b/switch/include/syslog.h
+new file mode 100644
+index 00000000..caaa15db
+--- /dev/null
++++ b/switch/include/syslog.h
+@@ -0,0 +1,71 @@
++/* KOReader for Nintendo Switch: <syslog.h> (no-op implementation in `switch/compat/syslog.c`). */
++
++#ifndef KOSWITCH_SYSLOG_H
++#define KOSWITCH_SYSLOG_H
++
++#include <stdarg.h>
++
++/* Priorities. */
++#define LOG_EMERG   0
++#define LOG_ALERT   1
++#define LOG_CRIT    2
++#define LOG_ERR     3
++#define LOG_WARNING 4
++#define LOG_NOTICE  5
++#define LOG_INFO    6
++#define LOG_DEBUG   7
++
++#define LOG_PRIMASK 0x07
++#define LOG_PRI(p)  ((p) & LOG_PRIMASK)
++
++/* Facilities. */
++#define LOG_KERN     (0 << 3)
++#define LOG_USER     (1 << 3)
++#define LOG_MAIL     (2 << 3)
++#define LOG_DAEMON   (3 << 3)
++#define LOG_AUTH     (4 << 3)
++#define LOG_SYSLOG   (5 << 3)
++#define LOG_LPR      (6 << 3)
++#define LOG_NEWS     (7 << 3)
++#define LOG_UUCP     (8 << 3)
++#define LOG_CRON     (9 << 3)
++#define LOG_AUTHPRIV (10 << 3)
++#define LOG_FTP      (11 << 3)
++#define LOG_LOCAL0   (16 << 3)
++#define LOG_LOCAL1   (17 << 3)
++#define LOG_LOCAL2   (18 << 3)
++#define LOG_LOCAL3   (19 << 3)
++#define LOG_LOCAL4   (20 << 3)
++#define LOG_LOCAL5   (21 << 3)
++#define LOG_LOCAL6   (22 << 3)
++#define LOG_LOCAL7   (23 << 3)
++
++#define LOG_FACMASK 0x03f8
++#define LOG_FAC(p)  (((p) & LOG_FACMASK) >> 3)
++
++/* Options. */
++#define LOG_PID    0x01
++#define LOG_CONS   0x02
++#define LOG_ODELAY 0x04
++#define LOG_NDELAY 0x08
++#define LOG_NOWAIT 0x10
++#define LOG_PERROR 0x20
++
++#define LOG_MASK(pri) (1 << (pri))
++#define LOG_UPTO(pri) ((1 << ((pri) + 1)) - 1)
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++void openlog(const char *ident, int option, int facility);
++void syslog(int priority, const char *format, ...);
++void vsyslog(int priority, const char *format, va_list ap);
++void closelog(void);
++int setlogmask(int mask);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif
+diff --git a/switch/include/time.h b/switch/include/time.h
+new file mode 100644
+index 00000000..a733ddbc
+--- /dev/null
++++ b/switch/include/time.h
+@@ -0,0 +1,23 @@
++/* KOReader for Nintendo Switch: newlib's <time.h>, plus a few POSIX / BSD bits it lacks. */
++
++#include_next <time.h>
++
++#ifndef KOSWITCH_TIME_H
++#define KOSWITCH_TIME_H
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/* Provided by `switch/compat/timegm.c`. */
++time_t timegm(struct tm *tm);
++
++/* Aliases for newlib's `_timezone` & `_daylight` (c.f. `--defsym` in the specs file generated by `Makefile`). */
++extern long timezone;
++extern int daylight;
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif
+diff --git a/switch/input.c b/switch/input.c
+new file mode 100644
+index 00000000..77b31656
+--- /dev/null
++++ b/switch/input.c
+@@ -0,0 +1,214 @@
++/*
++    KOReader for Nintendo Switch: input.
++
++    The port is operated with the touch screen only: no Joy-Con or controller
++    is needed (or used). This translates libnx touch screen and applet state
++    into <linux/input.h>-like events, which `ffi/input_switch.lua` hands to the
++    frontend (multi-touch protocol B, like on Kobo).
++*/
++
++#include <switch.h>
++
++#include <string.h>
++#include <time.h>
++
++#include "koswitch.h"
++
++#define MAX_SLOTS 10
++/* Size of HID's touch screen history (c.f., `hidGetTouchScreenStates`). */
++#define TOUCH_HISTORY 17
++/* At most, a sample adds or updates every slot (4 events each), plus SYN_REPORT. */
++#define MAX_SAMPLE_EVENTS (MAX_SLOTS * 4 + 1)
++
++/* Poll faster while the screen is being touched (and for a moment after), to spare the battery otherwise. */
++#define POLL_ACTIVE_NS   8000000ULL  /* ~120 Hz */
++#define POLL_IDLE_NS     16666667ULL /* ~60 Hz */
++#define ACTIVE_LINGER_NS 1000000000ULL
++
++typedef struct {
++    bool active;
++    u32 finger_id;
++    u32 x;
++    u32 y;
++} touch_slot;
++
++typedef struct {
++    ko_input_event *events;
++    int count;
++    int max;
++    struct timespec ts;
++} event_queue;
++
++static bool g_ready;
++static bool g_quit_sent;
++static bool g_touch_synced;
++static u64 g_touch_sampling_number;
++static u64 g_last_touch_ns;
++static int g_operation_mode = -1;
++static touch_slot g_slots[MAX_SLOTS];
++
++static u64 timespec_to_ns(const struct timespec *ts)
++{
++    return (u64)ts->tv_sec * 1000000000ULL + (u64)ts->tv_nsec;
++}
++
++static void emit(event_queue *q, int type, int code, int value)
++{
++    if (q->count >= q->max)
++        return;
++    ko_input_event *ev = &q->events[q->count++];
++    ev->type = type;
++    ev->code = code;
++    ev->value = value;
++    ev->reserved = 0;
++    ev->sec = q->ts.tv_sec;
++    ev->usec = q->ts.tv_nsec / 1000;
++}
++
++int ko_input_init(void)
++{
++    if (g_ready)
++        return 0;
++    hidInitializeTouchScreen();
++    g_ready = true;
++    return 0;
++}
++
++static bool any_slot_active(void)
++{
++    for (int s = 0; s < MAX_SLOTS; s++) {
++        if (g_slots[s].active)
++            return true;
++    }
++    return false;
++}
++
++/* Turns one touch screen sample into events. Returns true if anything changed. */
++static bool process_touch_sample(event_queue *q, const HidTouchScreenState *state)
++{
++    bool seen[MAX_SLOTS] = { false };
++    bool dirty = false;
++    int count = state->count < 0 ? 0 : state->count > 16 ? 16 : state->count;
++    for (int i = 0; i < count; i++) {
++        const HidTouchState *t = &state->touches[i];
++        u32 x = t->x < KO_FB_WIDTH ? t->x : KO_FB_WIDTH - 1;
++        u32 y = t->y < KO_FB_HEIGHT ? t->y : KO_FB_HEIGHT - 1;
++        int slot = -1;
++        for (int s = 0; s < MAX_SLOTS; s++) {
++            if (g_slots[s].active && g_slots[s].finger_id == t->finger_id) {
++                slot = s;
++                break;
++            }
++        }
++        if (slot < 0) {
++            /* New contact. */
++            for (int s = 0; s < MAX_SLOTS; s++) {
++                if (!g_slots[s].active && !seen[s]) {
++                    slot = s;
++                    break;
++                }
++            }
++            if (slot < 0)
++                continue;
++            g_slots[slot] = (touch_slot){ true, t->finger_id, x, y };
++            emit(q, KO_EV_ABS, KO_ABS_MT_SLOT, slot);
++            emit(q, KO_EV_ABS, KO_ABS_MT_TRACKING_ID, slot);
++            emit(q, KO_EV_ABS, KO_ABS_MT_POSITION_X, x);
++            emit(q, KO_EV_ABS, KO_ABS_MT_POSITION_Y, y);
++            dirty = true;
++        } else if (g_slots[slot].x != x || g_slots[slot].y != y) {
++            /* Motion. */
++            g_slots[slot].x = x;
++            g_slots[slot].y = y;
++            emit(q, KO_EV_ABS, KO_ABS_MT_SLOT, slot);
++            emit(q, KO_EV_ABS, KO_ABS_MT_POSITION_X, x);
++            emit(q, KO_EV_ABS, KO_ABS_MT_POSITION_Y, y);
++            dirty = true;
++        }
++        seen[slot] = true;
++    }
++    for (int s = 0; s < MAX_SLOTS; s++) {
++        if (g_slots[s].active && !seen[s]) {
++            /* Lift. */
++            g_slots[s].active = false;
++            emit(q, KO_EV_ABS, KO_ABS_MT_SLOT, s);
++            emit(q, KO_EV_ABS, KO_ABS_MT_TRACKING_ID, -1);
++            dirty = true;
++        }
++    }
++    if (dirty)
++        emit(q, KO_EV_SYN, KO_SYN_REPORT, 0);
++    return dirty;
++}
++
++static void poll_touch(event_queue *q, u64 now)
++{
++    HidTouchScreenState states[TOUCH_HISTORY];
++    size_t total = hidGetTouchScreenStates(states, TOUCH_HISTORY);
++    if (total == 0)
++        return;
++    /*
++        `states[0]` is the latest sample: replay the ones not seen yet, oldest first, so quick
++        taps and swipe paths aren't lost between two polls. If the sampling numbers went back
++        (e.g. HID was reset), resynchronize on the latest sample.
++    */
++    size_t unseen = 1;
++    if (g_touch_synced && states[0].sampling_number >= g_touch_sampling_number) {
++        unseen = 0;
++        while (unseen < total && states[unseen].sampling_number > g_touch_sampling_number)
++            unseen++;
++    }
++    for (size_t i = unseen; i-- > 0;) {
++        /* Keep whole samples together: the rest is picked up by the next poll. */
++        if (q->count > 0 && q->max - q->count < MAX_SAMPLE_EVENTS)
++            break;
++        if (process_touch_sample(q, &states[i]))
++            g_last_touch_ns = now;
++        g_touch_sampling_number = states[i].sampling_number;
++        g_touch_synced = true;
++    }
++}
++
++int ko_input_poll(ko_input_event *events, int max_events, int timeout_ms)
++{
++    ko_input_init();
++    struct timespec ts;
++    clock_gettime(CLOCK_MONOTONIC, &ts);
++    const u64 start = timespec_to_ns(&ts);
++    for (;;) {
++        event_queue q = { .events = events, .count = 0, .max = max_events };
++        clock_gettime(CLOCK_MONOTONIC, &q.ts);
++        const u64 now = timespec_to_ns(&q.ts);
++
++        /* Also services applet messages (focus, HOME menu, exit requests…). */
++        if (!appletMainLoop() && !g_quit_sent) {
++            g_quit_sent = true;
++            emit(&q, KO_EV_SDL, KO_SDL_QUIT, 1);
++            return q.count;
++        }
++
++        int mode = appletGetOperationMode();
++        if (mode != g_operation_mode) {
++            if (g_operation_mode >= 0)
++                emit(&q, KO_EV_SDL, KO_SDL_OPERATION_MODE, mode);
++            g_operation_mode = mode;
++        }
++
++        poll_touch(&q, now);
++        if (q.count > 0)
++            return q.count;
++
++        if (timeout_ms == 0)
++            return 0;
++        u64 interval = any_slot_active() || now - g_last_touch_ns < ACTIVE_LINGER_NS ? POLL_ACTIVE_NS : POLL_IDLE_NS;
++        if (timeout_ms > 0) {
++            const u64 timeout = (u64)timeout_ms * 1000000ULL;
++            const u64 elapsed = now - start;
++            if (elapsed >= timeout)
++                return 0;
++            if (timeout - elapsed < interval)
++                interval = timeout - elapsed;
++        }
++        svcSleepThread(interval);
++    }
++}
+diff --git a/switch/install.c b/switch/install.c
+new file mode 100644
+index 00000000..d00aa9b1
+--- /dev/null
++++ b/switch/install.c
+@@ -0,0 +1,292 @@
++/*
++    KOReader for Nintendo Switch: installation of the KOReader tree (c.f., `install.h`).
++*/
++
++#include "install.h"
++
++#include <dirent.h>
++#include <errno.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/stat.h>
++#include <unistd.h>
++
++/* A hash of the tree, generated when packaging (the version alone doesn't change with every build). */
++#define VERSION_MARKER   ".install-id"
++#define REINSTALL_MARKER ".reinstall"
++#define MANIFEST         ".install-manifest"
++#define MANIFEST_TMP     ".install-manifest.tmp"
++#define PATH_SIZE        1024
++#define COPY_BUFFER_SIZE (512 * 1024)
++
++typedef struct {
++    char **items;
++    size_t count;
++    size_t capacity;
++} path_list;
++
++static bool list_add(path_list *list, const char *path)
++{
++    if (list->count == list->capacity) {
++        size_t capacity = list->capacity ? list->capacity * 2 : 1024;
++        char **items = realloc(list->items, capacity * sizeof(*items));
++        if (!items)
++            return false;
++        list->items = items;
++        list->capacity = capacity;
++    }
++    char *copy = strdup(path);
++    if (!copy)
++        return false;
++    list->items[list->count++] = copy;
++    return true;
++}
++
++static void list_free(path_list *list)
++{
++    for (size_t i = 0; i < list->count; i++)
++        free(list->items[i]);
++    free(list->items);
++    *list = (path_list){ 0 };
++}
++
++static int compare_paths(const void *a, const void *b)
++{
++    return strcmp(*(const char *const *)a, *(const char *const *)b);
++}
++
++/* NOTE: the list must be sorted. */
++static bool list_contains(const path_list *list, const char *path)
++{
++    return list->count && bsearch(&path, list->items, list->count, sizeof(*list->items), compare_paths);
++}
++
++static bool join(char *out, const char *root, const char *rel)
++{
++    int n = snprintf(out, PATH_SIZE, "%s/%s", root, rel);
++    return n > 0 && n < PATH_SIZE;
++}
++
++static bool is_directory(const char *path)
++{
++    struct stat st;
++    return stat(path, &st) == 0 && S_ISDIR(st.st_mode);
++}
++
++static bool read_first_line(const char *path, char *buf, size_t size)
++{
++    FILE *fp = fopen(path, "r");
++    if (!fp)
++        return false;
++    bool ok = fgets(buf, (int)size, fp) != NULL;
++    fclose(fp);
++    if (ok)
++        buf[strcspn(buf, "\r\n")] = '\0';
++    return ok;
++}
++
++/* Lists the files under `root` (as paths relative to it). */
++static bool collect_files(const char *root, const char *rel, path_list *list)
++{
++    char dir[PATH_SIZE];
++    int n = rel[0] ? snprintf(dir, sizeof(dir), "%s/%s", root, rel) : snprintf(dir, sizeof(dir), "%s", root);
++    if (n <= 0 || n >= (int)sizeof(dir))
++        return false;
++    DIR *d = opendir(dir);
++    if (!d)
++        return false;
++    bool ok = true;
++    struct dirent *e;
++    while (ok && (e = readdir(d))) {
++        if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, ".."))
++            continue;
++        char child_rel[PATH_SIZE], child[PATH_SIZE];
++        n = rel[0] ? snprintf(child_rel, sizeof(child_rel), "%s/%s", rel, e->d_name)
++                   : snprintf(child_rel, sizeof(child_rel), "%s", e->d_name);
++        if (n <= 0 || n >= (int)sizeof(child_rel) || !join(child, root, child_rel))
++            ok = false;
++        else if (is_directory(child))
++            ok = collect_files(root, child_rel, list);
++        else
++            ok = list_add(list, child_rel);
++    }
++    closedir(d);
++    return ok;
++}
++
++/* Creates the missing parent directories of `rel`, below `root`. */
++static bool make_parents(const char *root, const char *rel)
++{
++    char path[PATH_SIZE];
++    if (!join(path, root, rel))
++        return false;
++    for (char *p = path + strlen(root) + 1; (p = strchr(p, '/')); p++) {
++        *p = '\0';
++        bool ok = mkdir(path, 0777) == 0 || errno == EEXIST || is_directory(path);
++        *p = '/';
++        if (!ok)
++            return false;
++    }
++    return true;
++}
++
++static bool copy_file(const char *src, const char *dst, char *buffer)
++{
++    FILE *in = fopen(src, "rb");
++    if (!in)
++        return false;
++    FILE *out = fopen(dst, "wb");
++    if (!out) {
++        fclose(in);
++        return false;
++    }
++    bool ok = true;
++    size_t n;
++    while ((n = fread(buffer, 1, COPY_BUFFER_SIZE, in)) > 0) {
++        if (fwrite(buffer, 1, n, out) != n) {
++            ok = false;
++            break;
++        }
++    }
++    if (ferror(in))
++        ok = false;
++    fclose(in);
++    if (fclose(out) != 0)
++        ok = false;
++    return ok;
++}
++
++/* Manifest entries are only ever deleted if they're plain relative paths below the installation. */
++static bool is_safe_relative_path(const char *rel)
++{
++    if (!rel[0] || rel[0] == '/' || strchr(rel, '\\') || strchr(rel, ':'))
++        return false;
++    for (const char *p = rel; *p;) {
++        size_t n = strcspn(p, "/");
++        if (n == 0 || (n == 1 && p[0] == '.') || (n == 2 && p[0] == '.' && p[1] == '.'))
++            return false;
++        p += n;
++        if (*p == '/')
++            p++;
++    }
++    return true;
++}
++
++static void read_manifest(const char *dst, path_list *list)
++{
++    char path[PATH_SIZE], line[PATH_SIZE];
++    if (!join(path, dst, MANIFEST))
++        return;
++    FILE *fp = fopen(path, "r");
++    if (!fp)
++        return;
++    while (fgets(line, sizeof(line), fp)) {
++        line[strcspn(line, "\r\n")] = '\0';
++        if (line[0] && !list_add(list, line))
++            break;
++    }
++    fclose(fp);
++}
++
++/* Best effort: without a manifest, the next update just can't clean up after this one. */
++static void write_manifest(const char *dst, const path_list *files)
++{
++    char tmp[PATH_SIZE], path[PATH_SIZE];
++    if (!join(tmp, dst, MANIFEST_TMP) || !join(path, dst, MANIFEST))
++        return;
++    FILE *fp = fopen(tmp, "w");
++    if (!fp)
++        return;
++    bool ok = true;
++    for (size_t i = 0; ok && i < files->count; i++)
++        ok = fputs(files->items[i], fp) >= 0 && fputc('\n', fp) != EOF;
++    if (fclose(fp) != 0 || !ok) {
++        unlink(tmp);
++        return;
++    }
++    /* NOTE: renaming over an existing file fails on some filesystems. */
++    if (rename(tmp, path) != 0 && (unlink(path), rename(tmp, path) != 0))
++        unlink(tmp);
++}
++
++/* Removes the directories left empty by the removal of `rel`, up to (excluding) `root`. */
++static void remove_empty_parents(const char *root, const char *rel)
++{
++    char path[PATH_SIZE];
++    if (!join(path, root, rel))
++        return;
++    const size_t root_len = strlen(root);
++    for (char *slash = strrchr(path, '/'); slash && (size_t)(slash - path) > root_len; slash = strrchr(path, '/')) {
++        *slash = '\0';
++        if (rmdir(path) != 0)
++            break;
++    }
++}
++
++bool ko_install_needed(const char *src, const char *dst)
++{
++    char path[PATH_SIZE], embedded[128], installed[128];
++    if (!join(path, src, VERSION_MARKER) || !read_first_line(path, embedded, sizeof(embedded)))
++        return false;
++    if (join(path, dst, REINSTALL_MARKER) && access(path, F_OK) == 0) {
++        unlink(path);
++        return true;
++    }
++    if (!join(path, dst, VERSION_MARKER) || !read_first_line(path, installed, sizeof(installed)))
++        return true;
++    return strcmp(embedded, installed) != 0;
++}
++
++bool ko_install(const char *src, const char *dst, ko_install_progress progress, void *userdata)
++{
++    bool ok = false;
++    path_list files = { 0 }, previous = { 0 };
++    char s[PATH_SIZE], d[PATH_SIZE];
++    char *buffer = malloc(COPY_BUFFER_SIZE);
++    if (!buffer)
++        goto out;
++    if (mkdir(dst, 0777) != 0 && errno != EEXIST && !is_directory(dst))
++        goto out;
++    if (!collect_files(src, "", &files))
++        goto out;
++    qsort(files.items, files.count, sizeof(*files.items), compare_paths);
++    if (!list_contains(&files, VERSION_MARKER))
++        goto out;
++
++    /* Until the version marker is written back, an interrupted install is resumed on the next launch. */
++    if (!join(d, dst, VERSION_MARKER) || (unlink(d) != 0 && errno != ENOENT))
++        goto out;
++
++    const unsigned total = (unsigned)files.count - 1;
++    unsigned done = 0;
++    for (size_t i = 0; i < files.count; i++) {
++        const char *rel = files.items[i];
++        if (!strcmp(rel, VERSION_MARKER))
++            continue;
++        if (!join(s, src, rel) || !join(d, dst, rel) || !make_parents(dst, rel) || !copy_file(s, d, buffer))
++            goto out;
++        if (progress)
++            progress(++done, total, userdata);
++    }
++
++    /* Remove what the previous version installed, and this one doesn't have anymore. */
++    read_manifest(dst, &previous);
++    for (size_t i = 0; i < previous.count; i++) {
++        const char *rel = previous.items[i];
++        struct stat st;
++        if (!is_safe_relative_path(rel) || list_contains(&files, rel) || !join(d, dst, rel) ||
++            stat(d, &st) != 0 || !S_ISREG(st.st_mode))
++            continue;
++        if (unlink(d) == 0)
++            remove_empty_parents(dst, rel);
++    }
++    write_manifest(dst, &files);
++
++    ok = join(s, src, VERSION_MARKER) && join(d, dst, VERSION_MARKER) && copy_file(s, d, buffer);
++out:
++    list_free(&files);
++    list_free(&previous);
++    free(buffer);
++    return ok;
++}
+diff --git a/switch/install.h b/switch/install.h
+new file mode 100644
+index 00000000..a8a507ce
+--- /dev/null
++++ b/switch/install.h
+@@ -0,0 +1,30 @@
++/*
++    KOReader for Nintendo Switch: installation of the KOReader tree.
++
++    The tree is embedded in the RomFS, and copied to the SD card on first launch, and
++    whenever the embedded version differs from the installed one. Files installed by a
++    previous version that are gone from the new one are then removed, going by the list
++    of installed files kept alongside (`.install-manifest`): files added by the user
++    (settings, fonts, dictionaries, plugins…) are never touched.
++
++    NOTE: plain POSIX, so it can be tested on the host (c.f., `install_test.c`).
++*/
++
++#ifndef KOREADER_SWITCH_INSTALL_H
++#define KOREADER_SWITCH_INSTALL_H
++
++#include <stdbool.h>
++
++typedef void (*ko_install_progress)(unsigned done, unsigned total, void *userdata);
++
++/*
++    Whether `dst` needs a (re)install from `src`: its version marker is missing or different,
++    or a reinstall was requested (with an empty `.reinstall` file, which is consumed).
++    Always false if `src` has no version marker.
++*/
++bool ko_install_needed(const char *src, const char *dst);
++
++/* Installs the tree at `src` over `dst`. The version marker is written last, so an interrupted install is resumed. */
++bool ko_install(const char *src, const char *dst, ko_install_progress progress, void *userdata);
++
++#endif
+diff --git a/switch/install_test.c b/switch/install_test.c
+new file mode 100644
+index 00000000..32f5ca46
+--- /dev/null
++++ b/switch/install_test.c
+@@ -0,0 +1,176 @@
++/*
++    Host test for `install.c` (not part of the build):
++        cc -std=gnu11 -Wall -Wextra -o install_test install.c install_test.c && ./install_test /tmp/somewhere
++*/
++
++#include "install.h"
++
++#include <limits.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/stat.h>
++#include <unistd.h>
++
++static int failures;
++
++#define CHECK(cond)                                                             \
++    do {                                                                        \
++        if (!(cond)) {                                                          \
++            fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond);     \
++            failures++;                                                         \
++        }                                                                       \
++    } while (0)
++
++static void make_path(char *out, const char *root, const char *rel)
++{
++    snprintf(out, PATH_MAX, "%s/%s", root, rel);
++}
++
++static void write_file(const char *root, const char *rel, const char *content)
++{
++    char path[PATH_MAX];
++    make_path(path, root, rel);
++    mkdir(root, 0777);
++    for (char *p = path + strlen(root) + 1; (p = strchr(p, '/')); p++) {
++        *p = '\0';
++        mkdir(path, 0777);
++        *p = '/';
++    }
++    FILE *fp = fopen(path, "w");
++    if (!fp) {
++        perror(path);
++        exit(2);
++    }
++    fputs(content, fp);
++    fclose(fp);
++}
++
++static bool exists(const char *root, const char *rel)
++{
++    char path[PATH_MAX];
++    struct stat st;
++    make_path(path, root, rel);
++    return stat(path, &st) == 0;
++}
++
++static bool has_content(const char *root, const char *rel, const char *expected)
++{
++    char path[PATH_MAX], buf[4096] = "";
++    make_path(path, root, rel);
++    FILE *fp = fopen(path, "r");
++    if (!fp)
++        return false;
++    size_t n = fread(buf, 1, sizeof(buf) - 1, fp);
++    buf[n] = '\0';
++    fclose(fp);
++    return strcmp(buf, expected) == 0;
++}
++
++static unsigned progress_calls, progress_done, progress_total;
++
++static void on_progress(unsigned done, unsigned total, void *userdata)
++{
++    CHECK(userdata == &progress_calls);
++    progress_calls++;
++    progress_done = done;
++    progress_total = total;
++}
++
++int main(int argc, char *argv[])
++{
++    if (argc != 2) {
++        fprintf(stderr, "usage: %s EMPTY_DIRECTORY\n", argv[0]);
++        return 2;
++    }
++    const char *base = argv[1];
++    char src[PATH_MAX], dst[PATH_MAX], fresh[PATH_MAX], empty[PATH_MAX], path[PATH_MAX];
++    make_path(src, base, "romfs");
++    make_path(dst, base, "sdcard");
++    make_path(fresh, base, "fresh");
++    make_path(empty, base, "empty");
++    mkdir(empty, 0777);
++
++    /* Embedded tree, identified by `.install-id`: one plugin of the previous build is gone. */
++    write_file(src, ".install-id", "tree2\n");
++    write_file(src, "git-rev", "v2\n");
++    write_file(src, "reader.lua", "reader v2");
++    write_file(src, "plugins/kept.koplugin/main.lua", "kept v2");
++
++    /* Installed tree (same version, previous build), with files added by the user, and a tampered manifest. */
++    write_file(dst, ".install-id", "tree1\n");
++    write_file(dst, "git-rev", "v2\n");
++    write_file(dst, "reader.lua", "reader v1");
++    write_file(dst, "plugins/gone.koplugin/main.lua", "gone");
++    write_file(dst, "plugins/gone.koplugin/sub/extra.lua", "gone too");
++    write_file(dst, "plugins/kept.koplugin/main.lua", "kept v1");
++    write_file(dst, "plugins/user.koplugin/main.lua", "user plugin");
++    write_file(dst, "settings.reader.lua", "user settings");
++    write_file(dst, ".install-manifest",
++               ".install-id\ngit-rev\nreader.lua\n"
++               "plugins/gone.koplugin/main.lua\nplugins/gone.koplugin/sub/extra.lua\n"
++               "plugins/kept.koplugin/main.lua\n"
++               "../outside.txt\n/etc/hosts\nplugins/../settings.reader.lua\n./settings.reader.lua\n"
++               "plugins//user.koplugin/main.lua\nplugins\n\n");
++    write_file(base, "outside.txt", "outside");
++
++    /* Update. */
++    CHECK(ko_install_needed(src, dst));
++    CHECK(ko_install(src, dst, on_progress, &progress_calls));
++    CHECK(!ko_install_needed(src, dst));
++    CHECK(has_content(dst, ".install-id", "tree2\n"));
++    CHECK(has_content(dst, "git-rev", "v2\n"));
++    CHECK(has_content(dst, "reader.lua", "reader v2"));
++    CHECK(has_content(dst, "plugins/kept.koplugin/main.lua", "kept v2"));
++    CHECK(progress_calls == 3 && progress_done == 3 && progress_total == 3);
++    /* Obsolete files are removed, along with the directories they leave empty. */
++    CHECK(!exists(dst, "plugins/gone.koplugin/main.lua"));
++    CHECK(!exists(dst, "plugins/gone.koplugin/sub/extra.lua"));
++    CHECK(!exists(dst, "plugins/gone.koplugin"));
++    CHECK(exists(dst, "plugins/kept.koplugin"));
++    /* The user's files, and anything outside the installation, are left alone. */
++    CHECK(has_content(dst, "plugins/user.koplugin/main.lua", "user plugin"));
++    CHECK(has_content(dst, "settings.reader.lua", "user settings"));
++    CHECK(has_content(base, "outside.txt", "outside"));
++    CHECK(exists(dst, "plugins"));
++    /* The manifest now lists this build's files. */
++    CHECK(has_content(dst, ".install-manifest", ".install-id\ngit-rev\nplugins/kept.koplugin/main.lua\nreader.lua\n"));
++    CHECK(!exists(dst, ".install-manifest.tmp"));
++
++    /* Requested reinstall: the marker is consumed. */
++    write_file(dst, ".reinstall", "");
++    CHECK(ko_install_needed(src, dst));
++    CHECK(!exists(dst, ".reinstall"));
++    CHECK(!ko_install_needed(src, dst));
++
++    /* Installation made by a build without `.install-id`: reinstalled. */
++    make_path(path, dst, ".install-id");
++    unlink(path);
++    CHECK(ko_install_needed(src, dst));
++
++    /* Fresh install, into a directory that doesn't exist yet, without progress callback. */
++    CHECK(ko_install_needed(src, fresh));
++    CHECK(ko_install(src, fresh, NULL, NULL));
++    CHECK(has_content(fresh, "plugins/kept.koplugin/main.lua", "kept v2"));
++    CHECK(has_content(fresh, ".install-id", "tree2\n"));
++    CHECK(!ko_install_needed(src, fresh));
++
++    /* Interrupted install (no marker): needed again, and resumed. */
++    make_path(path, fresh, ".install-id");
++    unlink(path);
++    CHECK(ko_install_needed(src, fresh));
++    CHECK(ko_install(src, fresh, NULL, NULL));
++    CHECK(!ko_install_needed(src, fresh));
++
++    /* A tree without marker is never installed. */
++    CHECK(!ko_install_needed(empty, fresh));
++    CHECK(!ko_install(empty, fresh, NULL, NULL));
++    CHECK(has_content(fresh, ".install-id", "tree2\n"));
++
++    /* A missing source fails cleanly. */
++    make_path(path, base, "missing");
++    CHECK(!ko_install(path, fresh, NULL, NULL));
++
++    printf(failures ? "install_test: %d failure(s)\n" : "install_test: all checks passed\n", failures);
++    return failures != 0;
++}
+diff --git a/switch/koswitch.h b/switch/koswitch.h
+new file mode 100644
+index 00000000..ca2e79bc
+--- /dev/null
++++ b/switch/koswitch.h
+@@ -0,0 +1,65 @@
++/*
++    KOReader for Nintendo Switch (libnx homebrew): native glue.
++
++    Everything declared here is also exposed to Lua through `ffi/switch_h.lua`
++    (keep both in sync), and resolved via the link time symbol table.
++*/
++
++#ifndef KOREADER_SWITCH_H
++#define KOREADER_SWITCH_H
++
++#include <stdint.h>
++
++#define KO_FB_WIDTH  1280
++#define KO_FB_HEIGHT 720
++
++/* Input event types & codes, matching <linux/input.h> (and KOReader's EV_SDL). Touch screen only. */
++#define KO_EV_SYN 0
++#define KO_EV_ABS 3
++#define KO_EV_SDL 83
++
++#define KO_SYN_REPORT         0
++#define KO_ABS_MT_SLOT        47
++#define KO_ABS_MT_POSITION_X  53
++#define KO_ABS_MT_POSITION_Y  54
++#define KO_ABS_MT_TRACKING_ID 57
++
++/* EV_SDL codes. */
++#define KO_SDL_QUIT           1 /* value: unused */
++#define KO_SDL_OPERATION_MODE 2 /* value: 0 = handheld, 1 = docked */
++#define KO_SDL_CHARGING       3 /* value: 0 = unplugged, 1 = charging */
++
++typedef struct ko_input_event {
++    int32_t type;
++    int32_t code;
++    int32_t value;
++    int32_t reserved;
++    int64_t sec;
++    int64_t usec;
++} ko_input_event;
++
++/* Framebuffer (1280x720 RGBA8888, landscape: the panel's native orientation). */
++int  ko_fb_init(void);
++void ko_fb_close(void);
++void ko_fb_present(const uint8_t *pixels, int stride, int invert);
++
++/* Input. */
++int  ko_input_init(void);
++/*
++    Returns the number of events stored in `events` (0 on timeout); a negative timeout blocks.
++    NOTE: `max_events` should be at least 41, so a single touch screen sample always fits.
++*/
++int  ko_input_poll(ko_input_event *events, int max_events, int timeout_ms);
++
++/* Device. */
++int   ko_get_product_model(void);
++int   ko_is_applet_mode(void);
++int   ko_get_operation_mode(void);
++int   ko_get_battery_percentage(void);
++int   ko_is_charging(void);
++float ko_get_brightness(void);
++int   ko_set_brightness(float value);
++int   ko_is_network_connected(void);
++void  ko_set_auto_sleep_inhibited(int inhibited);
++
++#endif
+diff --git a/switch/main.c b/switch/main.c
+new file mode 100644
+index 00000000..41150d70
+--- /dev/null
++++ b/switch/main.c
+@@ -0,0 +1,463 @@
++/*
++    KOReader for Nintendo Switch: application entry point.
++
++    - installs the KOReader tree embedded in the RomFS to the SD card, on first
++      launch or after an update (c.f., `install.c`);
++    - shows a splash screen asking to turn the console sideways: the UI is laid
++      out in portrait, like on an e-reader (turned clockwise, power button on
++      the right);
++    - sets up the environment (logging, time zone, services);
++    - runs `reader.lua` with LuaJIT, on a thread with a comfortable stack.
++
++    Everything is operated with the touch screen, Joy-Con aren't needed: that's
++    also why exiting closes the application instead of going back to the
++    Homebrew Menu, which can only be closed with the + button.
++*/
++
++#include <switch.h>
++
++#include <ctype.h>
++#include <pthread.h>
++#include <setjmp.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/stat.h>
++#include <time.h>
++#include <unistd.h>
++
++#include <lauxlib.h>
++#include <lua.h>
++#include <lualib.h>
++
++#include "install.h"
++#include "koswitch.h"
++
++#define KO_HOME           "sdmc:/switch/koreader"
++#define KO_ROMFS          "romfs:/koreader"
++#define KO_LOG            "crash.log"
++#define KO_OLD_LOG        "crash.old.log"
++#define KO_LOG_MAX_SIZE   (1024 * 1024)
++#define KO_RESTART_CODE   85
++#define KO_PATH_SIZE      1024
++#define KO_LUA_STACK_SIZE (32 * 1024 * 1024)
++
++#define COLOR_TEXT   0x000000
++#define COLOR_ACCENT 0x505050
++
++/* libnx: 1 = close the application (or applet) on exit, instead of returning to the homebrew loader. */
++extern u32 __nx_applet_exit_mode;
++
++static char g_self_path[KO_PATH_SIZE];
++static uint8_t *g_screen;
++static bool g_restart;
++static int g_exit_status = EXIT_SUCCESS;
++/* `os.exit` unwinds back to `run_koreader` (c.f., `ko_os_exit`). */
++static jmp_buf g_exit_jmp;
++
++/* -- Static symbols ------------------------------------------------------------ */
++
++/* Generated at link time by `gen_symtab.py`. */
++typedef struct {
++    const char *name;
++    void *addr;
++} ko_symbol;
++
++extern const ko_symbol ko_symtab[];
++extern const size_t ko_symtab_size;
++
++static int ko_symbol_cmp(const void *key, const void *entry)
++{
++    return strcmp(key, ((const ko_symbol *)entry)->name);
++}
++
++/* Used by LuaJIT (`ffi.C`, `ffi.load`), c.f. `koreader-luajit-switch.patch`. */
++void *lj_clib_static_lookup(const char *name)
++{
++    const ko_symbol *s = bsearch(name, ko_symtab, ko_symtab_size, sizeof(*ko_symtab), ko_symbol_cmp);
++    return s ? s->addr : NULL;
++}
++
++/* -- Launcher UI ---------------------------------------------------------------- */
++
++static void put_pixel(int x, int y, uint32_t rgb)
++{
++    if ((unsigned)x >= KO_FB_WIDTH || (unsigned)y >= KO_FB_HEIGHT)
++        return;
++    uint8_t *p = g_screen + ((size_t)y * KO_FB_WIDTH + (size_t)x) * 4;
++    p[0] = rgb >> 16;
++    p[1] = rgb >> 8;
++    p[2] = rgb;
++    p[3] = 0xff;
++}
++
++/*
++    Draw text with the libnx console font (16x16 glyphs, one u16 per row, MSB first).
++    In portrait mode, coordinates are in the rotated 720x1280 space: the top of the text
++    points towards the console's left edge, matching the rotation used by the frontend.
++*/
++static void draw_text(const char *text, int x, int y, int scale, bool portrait, uint32_t rgb)
++{
++    const ConsoleFont *font = &consoleGetDefault()->font;
++    const uint16_t *gfx = font->gfx;
++    for (int n = 0; text[n]; n++) {
++        unsigned c = (unsigned char)text[n];
++        if (c < font->asciiOffset || c >= (unsigned)font->asciiOffset + font->numChars)
++            c = '?';
++        const uint16_t *glyph = gfx + 16 * (c - font->asciiOffset);
++        for (int row = 0; row < 16; row++) {
++            for (int col = 0; col < 16; col++) {
++                if (!(glyph[row] & (0x8000 >> col)))
++                    continue;
++                for (int dy = 0; dy < scale; dy++) {
++                    for (int dx = 0; dx < scale; dx++) {
++                        int ux = x + (n * 16 + col) * scale + dx;
++                        int uy = y + row * scale + dy;
++                        if (portrait)
++                            put_pixel(uy, KO_FB_HEIGHT - 1 - ux, rgb);
++                        else
++                            put_pixel(ux, uy, rgb);
++                    }
++                }
++            }
++        }
++    }
++}
++
++static void draw_text_centered(const char *text, int y, int scale, bool portrait, uint32_t rgb)
++{
++    int width = (int)strlen(text) * 16 * scale;
++    int screen_width = portrait ? KO_FB_HEIGHT : KO_FB_WIDTH;
++    draw_text(text, (screen_width - width) / 2, y, scale, portrait, rgb);
++}
++
++static void show_screen(const char *portrait_status, const char *landscape_title, const char *landscape_text)
++{
++    if (!g_screen)
++        return;
++    memset(g_screen, 0xff, (size_t)KO_FB_WIDTH * KO_FB_HEIGHT * 4);
++    /* Landscape: readable while the console is still held normally. */
++    if (landscape_title)
++        draw_text_centered(landscape_title, 48, 2, false, COLOR_TEXT);
++    if (landscape_text)
++        draw_text_centered(landscape_text, 96, 1, false, COLOR_ACCENT);
++    /* Portrait: readable once the console has been turned. */
++    draw_text_centered("KOReader", 520, 3, true, COLOR_TEXT);
++    if (portrait_status)
++        draw_text_centered(portrait_status, 600, strlen(portrait_status) <= 12 ? 2 : 1, true, COLOR_ACCENT);
++    ko_fb_present(g_screen, KO_FB_WIDTH, 0);
++}
++
++static void show_splash(const char *status)
++{
++    show_screen(status,
++                "Turn your Switch sideways",
++                "Rotate it 90 degrees clockwise, with the power button on the right");
++}
++
++/* Waits for a complete tap on the touch screen (ignoring a touch already in progress). */
++static void wait_for_tap(void)
++{
++    enum { WAIT_RELEASED, WAIT_TOUCH, WAIT_LIFT } phase = WAIT_RELEASED;
++    hidInitializeTouchScreen();
++    while (appletMainLoop()) {
++        HidTouchScreenState state = { 0 };
++        bool touching = hidGetTouchScreenStates(&state, 1) > 0 && state.count > 0;
++        if (phase == WAIT_RELEASED && !touching)
++            phase = WAIT_TOUCH;
++        else if (phase == WAIT_TOUCH && touching)
++            phase = WAIT_LIFT;
++        else if (phase == WAIT_LIFT && !touching)
++            break;
++        svcSleepThread(16000000ULL);
++    }
++}
++
++static void show_fatal_error(const char *message)
++{
++    fprintf(stderr, "KOReader: fatal error: %s\n", message);
++    if (!g_screen)
++        return;
++    memset(g_screen, 0xff, (size_t)KO_FB_WIDTH * KO_FB_HEIGHT * 4);
++    draw_text_centered("KOReader could not start", 48, 2, false, COLOR_TEXT);
++    /* Wrap the message to the screen width. */
++    char line[80];
++    const size_t cols = sizeof(line) - 1;
++    int y = 120;
++    for (const char *p = message; *p && y < KO_FB_HEIGHT - 80; y += 20) {
++        size_t n = strcspn(p, "\n");
++        if (n > cols)
++            n = cols;
++        memcpy(line, p, n);
++        line[n] = '\0';
++        /* The console font has no glyph for tabs (as found in Lua tracebacks). */
++        for (size_t i = 0; i < n; i++)
++            if (line[i] == '\t')
++                line[i] = ' ';
++        draw_text(line, 0, y, 1, false, COLOR_ACCENT);
++        p += n;
++        if (*p == '\n')
++            p++;
++    }
++    draw_text_centered("See /switch/koreader/crash.log - tap the screen to exit", KO_FB_HEIGHT - 48, 1, false, COLOR_TEXT);
++    ko_fb_present(g_screen, KO_FB_WIDTH, 0);
++    wait_for_tap();
++}
++
++static void on_install_progress(unsigned done, unsigned total, void *userdata)
++{
++    u64 *last_update = userdata;
++    u64 now = armTicksToNs(armGetSystemTick());
++    if (now - *last_update < 250000000ULL)
++        return;
++    *last_update = now;
++    char status[32];
++    snprintf(status, sizeof(status), "Installing: %u%%", total ? done * 100 / total : 0);
++    show_splash(status);
++}
++
++/* -- Environment ---------------------------------------------------------------- */
++
++/*
++    Without Joy-Con, the Homebrew Menu can't be closed (that needs the + button), so
++    leaving KOReader closes the application and goes straight back to the HOME menu.
++    Restarting goes through the homebrew loader instead (except when installed as a
++    title, c.f. `ko_os_exit`).
++*/
++static void set_exit_mode(void)
++{
++    __nx_applet_exit_mode = g_restart ? 0 : 1;
++}
++
++/* The log is appended to (so a crash can still be looked into after relaunching), and rotated when it gets big. */
++static void setup_logging(void)
++{
++    struct stat st;
++    if (stat(KO_LOG, &st) == 0 && st.st_size > KO_LOG_MAX_SIZE) {
++        unlink(KO_OLD_LOG);
++        rename(KO_LOG, KO_OLD_LOG);
++    }
++    if (!freopen(KO_LOG, "a", stdout))
++        return;
++    setvbuf(stdout, NULL, _IOLBF, 0);
++    /* A file can't be opened twice for writing: stderr (unbuffered) shares stdout's descriptor instead. */
++    fflush(stderr);
++    dup2(fileno(stdout), STDERR_FILENO);
++    if (fileno(stdout) != STDOUT_FILENO)
++        dup2(fileno(stdout), STDOUT_FILENO);
++}
++
++static void setup_timezone(void)
++{
++    u64 now;
++    TimeCalendarTime caltime;
++    TimeCalendarAdditionalInfo info;
++    if (R_FAILED(timeGetCurrentTime(TimeType_UserSystemClock, &now)) ||
++        R_FAILED(timeToCalendarTimeWithMyRule(now, &caltime, &info)))
++        return;
++    char name[sizeof(info.timezoneName) + 1] = "UTC";
++    size_t len = strnlen(info.timezoneName, sizeof(info.timezoneName));
++    bool valid = len >= 3;
++    for (size_t i = 0; i < len; i++)
++        valid = valid && isalpha((unsigned char)info.timezoneName[i]);
++    if (valid) {
++        memcpy(name, info.timezoneName, len);
++        name[len] = '\0';
++    }
++    /* POSIX TZ offsets are positive west of Greenwich. */
++    int offset = info.offset;
++    int abs_offset = offset < 0 ? -offset : offset;
++    char tz[32];
++    snprintf(tz, sizeof(tz), "%s%c%d:%02d:%02d", name, offset > 0 ? '-' : '+',
++             abs_offset / 3600, abs_offset % 3600 / 60, abs_offset % 60);
++    setenv("TZ", tz, 1);
++    tzset();
++}
++
++/* -- Lua -------------------------------------------------------------------------- */
++
++static int ko_os_exit(lua_State *L)
++{
++    int status;
++    if (lua_isboolean(L, 1))
++        status = lua_toboolean(L, 1) ? EXIT_SUCCESS : EXIT_FAILURE;
++    else
++        status = (int)luaL_optinteger(L, 1, EXIT_SUCCESS);
++    bool close = lua_toboolean(L, 2);
++    if (status == KO_RESTART_CODE) {
++        if (envIsNso()) {
++            /* Installed as a title (NSP): the system relaunches us once we've exited. */
++            appletRestartProgram(NULL, 0);
++        } else if (g_self_path[0] && envHasNextLoad() && R_SUCCEEDED(envSetNextLoad(g_self_path, g_self_path))) {
++            /* Ask the homebrew loader to start us again. */
++            g_restart = true;
++        }
++        status = EXIT_SUCCESS;
++    }
++    g_exit_status = status;
++    /* Like LuaJIT's `os.exit`: close the state (running finalizers) if asked to. */
++    if (close)
++        lua_close(L);
++    fflush(NULL);
++    /*
++        Don't `exit` from this thread: libnx's exit path switches to the main thread's stack
++        to return to the loader, while the main thread is still waiting for us. Unwind back
++        to `run_koreader` instead, and let `main` return.
++    */
++    longjmp(g_exit_jmp, 1);
++}
++
++/* `require` for Lua C modules, mirroring the monolibtic loader in `ffi/loadlib.lua`. */
++static int ko_static_searcher(lua_State *L)
++{
++    static const char prefix[] = "libs/libkoreader-";
++    const char *name = luaL_checkstring(L, 1);
++    char symbol[256];
++    if (strncmp(name, prefix, sizeof(prefix) - 1) == 0) {
++        snprintf(symbol, sizeof(symbol), "luaopen_%s", name + sizeof(prefix) - 1);
++    } else {
++        snprintf(symbol, sizeof(symbol), "luaopen_%s", name);
++        for (char *c = symbol; *c; c++)
++            if (*c == '.')
++                *c = '_';
++    }
++    lua_CFunction fn = (lua_CFunction)lj_clib_static_lookup(symbol);
++    if (!fn) {
++        lua_pushfstring(L, "\n\tno static symbol '%s'", symbol);
++        return 1;
++    }
++    lua_pushcfunction(L, fn);
++    return 1;
++}
++
++static int ko_traceback(lua_State *L)
++{
++    const char *msg = lua_tostring(L, 1);
++    luaL_traceback(L, L, msg ? msg : "(error object is not a string)", 1);
++    return 1;
++}
++
++/* The JIT compiler is disabled (no executable memory for machine code). */
++static const char ko_prelude[] =
++    "jit.opt = jit.opt or { start = function() end }\n"
++    "jit.on = function() end\n";
++
++static void *run_koreader(void *arg)
++{
++    (void)arg;
++    lua_State *L = luaL_newstate();
++    if (!L) {
++        show_fatal_error("Could not create the Lua state (out of memory?).");
++        g_exit_status = EXIT_FAILURE;
++        return NULL;
++    }
++    luaL_openlibs(L);
++
++    lua_getglobal(L, "os");
++    lua_pushcfunction(L, ko_os_exit);
++    lua_setfield(L, -2, "exit");
++    lua_pop(L, 1);
++
++    lua_getglobal(L, "package");
++    lua_getfield(L, -1, "loaders");
++    lua_pushcfunction(L, ko_static_searcher);
++    lua_rawseti(L, -2, (int)lua_objlen(L, -2) + 1);
++    lua_pop(L, 2);
++
++    lua_newtable(L);
++    lua_pushliteral(L, "reader.lua");
++    lua_rawseti(L, -2, 0);
++    lua_setglobal(L, "arg");
++
++    lua_pushcfunction(L, ko_traceback);
++    if (setjmp(g_exit_jmp) == 0) {
++        if (luaL_loadbuffer(L, ko_prelude, sizeof(ko_prelude) - 1, "=prelude") ||
++            lua_pcall(L, 0, 0, -2) ||
++            luaL_loadfile(L, "reader.lua") ||
++            lua_pcall(L, 0, 0, -2)) {
++            const char *msg = lua_tostring(L, -1);
++            show_fatal_error(msg ? msg : "unknown error");
++            g_exit_status = EXIT_FAILURE;
++        }
++        lua_close(L);
++    }
++    /* Otherwise, `os.exit` was called: the state was closed if requested, or left as is (like LuaJIT does). */
++    return NULL;
++}
++
++int main(int argc, char *argv[])
++{
++    /* Get notified (instead of being killed) when closed from the HOME menu. */
++    appletLockExit();
++    set_exit_mode();
++    if (argc > 0 && argv[0])
++        snprintf(g_self_path, sizeof(g_self_path), "%s", argv[0]);
++
++    g_screen = malloc((size_t)KO_FB_WIDTH * KO_FB_HEIGHT * 4);
++    if (!g_screen || ko_fb_init() != 0) {
++        free(g_screen);
++        g_screen = NULL;
++    }
++    show_splash("Loading...");
++
++    mkdir("sdmc:/switch", 0777);
++    mkdir(KO_HOME, 0777);
++
++    if (R_SUCCEEDED(romfsInit())) {
++        bool ok = true;
++        if (ko_install_needed(KO_ROMFS, KO_HOME)) {
++            u64 last_update = 0;
++            show_splash("Installing...");
++            ok = ko_install(KO_ROMFS, KO_HOME, on_install_progress, &last_update);
++        }
++        romfsExit();
++        if (!ok) {
++            show_fatal_error("Could not install KOReader to the SD card (is it full?).");
++            appletUnlockExit();
++            return EXIT_FAILURE;
++        }
++        show_splash("Loading...");
++    }
++
++    if (chdir(KO_HOME) != 0 || access("reader.lua", F_OK) != 0) {
++        show_fatal_error("KOReader is not installed in /switch/koreader.");
++        appletUnlockExit();
++        return EXIT_FAILURE;
++    }
++
++    setup_logging();
++    setup_timezone();
++    /* Point TLS certificate verification at the bundle we ship (there's no system CA store). */
++    setenv("TURBO_CAPATH", KO_HOME "/data/ca-bundle.crt", 1);
++    setenv("CURL_CA_BUNDLE", KO_HOME "/data/ca-bundle.crt", 1);
++    setenv("SSL_CERT_FILE", KO_HOME "/data/ca-bundle.crt", 1);
++    psmInitialize();
++    lblInitialize();
++    nifmInitialize(NifmServiceType_User);
++    socketInitializeDefault();
++    ko_input_init();
++
++    pthread_attr_t attr;
++    pthread_t thread;
++    pthread_attr_init(&attr);
++    pthread_attr_setstacksize(&attr, KO_LUA_STACK_SIZE);
++    if (pthread_create(&thread, &attr, run_koreader, NULL) == 0)
++        pthread_join(thread, NULL);
++    else
++        run_koreader(NULL);
++    pthread_attr_destroy(&attr);
++
++    socketExit();
++    nifmExit();
++    lblExit();
++    psmExit();
++    ko_fb_close();
++    free(g_screen);
++    set_exit_mode();
++    /* Release the exit lock taken at startup, so the process can actually terminate (→ HOME menu). */
++    appletUnlockExit();
++    fprintf(stderr, "KOReader: main() returning, status=%d, applet_exit_mode=%u\n",
++            g_exit_status, (unsigned)__nx_applet_exit_mode);
++    fflush(NULL);
++    return g_exit_status;
++}
+diff --git a/switch/stubs/libdl.a b/switch/stubs/libdl.a
+new file mode 100644
+index 00000000..8b277f0d
+--- /dev/null
++++ b/switch/stubs/libdl.a
+@@ -0,0 +1 @@
++!<arch>
+diff --git a/switch/stubs/librt.a b/switch/stubs/librt.a
+new file mode 100644
+index 00000000..8b277f0d
+--- /dev/null
++++ b/switch/stubs/librt.a
+@@ -0,0 +1 @@
++!<arch>
+diff --git a/thirdparty/cmake_modules/koreader_targets.cmake b/thirdparty/cmake_modules/koreader_targets.cmake
+index 00e95b66..2d58eb9c 100644
+--- a/thirdparty/cmake_modules/koreader_targets.cmake
++++ b/thirdparty/cmake_modules/koreader_targets.cmake
+@@ -76,7 +76,7 @@ endfunction()
+ # KOREADER LIBRARIES. {{{
+ 
+ # blitbuffer
+-if(ANDROID OR CERVANTES OR KINDLE OR KOBO OR POCKETBOOK OR REMARKABLE OR SONY_PRSTUX OR USE_SDL)
++if(ANDROID OR CERVANTES OR KINDLE OR KOBO OR POCKETBOOK OR REMARKABLE OR SONY_PRSTUX OR SWITCH OR USE_SDL)
+     set(EXCLUDE_FROM_ALL)
+ else()
+     set(EXCLUDE_FROM_ALL EXCLUDE_FROM_ALL)
+@@ -114,7 +114,7 @@ set(DEPENDS luajit::luajit)
+ if(KINDLE OR REMARKABLE)
+     list(APPEND DEPENDS popen-noshell::popen-noshell)
+ endif()
+-if(ANDROID OR POCKETBOOK OR USE_SDL)
++if(ANDROID OR POCKETBOOK OR SWITCH OR USE_SDL)
+     set(EXCLUDE_FROM_ALL EXCLUDE_FROM_ALL)
+ else()
+     set(EXCLUDE_FROM_ALL)
+@@ -222,7 +222,7 @@ declare_koreader_target(
+ )
+ 
+ # unpack
+-if(NOT (ANDROID OR APPLE OR EMULATE_READER))
++if(NOT (ANDROID OR APPLE OR EMULATE_READER OR SWITCH))
+     set(EXCLUDE_FROM_ALL)
+ else()
+     set(EXCLUDE_FROM_ALL EXCLUDE_FROM_ALL)
+@@ -238,7 +238,7 @@ declare_koreader_target(
+ 
+ # MONOLIBTIC. {{{
+ 
+-if(MONOLIBTIC)
++if(MONOLIBTIC AND NOT SWITCH)
+ 
+     set(DEPENDS)
+     foreach(NAME IN LISTS KOREADER_TARGETS)
+@@ -343,4 +343,83 @@ endif()
+ 
+ # }}}
+ 
++# SWITCH. {{{
++
++if(SWITCH)
++
++    # Nintendo Switch homebrew: there's no dynamic loader, so everything is statically
++    # linked into a single executable (later packaged as an NRO by the frontend).
++    set(DEPENDS)
++    foreach(NAME IN LISTS KOREADER_TARGETS)
++        if(${NAME}_TYPE STREQUAL "monolibtic" AND NOT ${NAME}_EXCLUDE_FROM_ALL)
++            list(APPEND DEPENDS ${NAME} ${${NAME}_DEPENDS})
++        endif()
++    endforeach()
++    declare_koreader_target(
++        koreader-switch TYPE executable
++        DEPENDS ${DEPENDS}
++        # Transitive dependencies (c.f., `koreader-monolibtic`).
++        libarchive::libarchive
++        freetype2::freetype
++        giflib::gif
++        harfbuzz::harfbuzz
++        koreader-lfs::koreader-lfs
++        leptonica::leptonica
++        libjpeg-turbo::turbojpeg
++        libk2pdfopt::k2pdfopt
++        libressl::crypto
++        libressl::ssl
++        lodepng::lodepng
++        lpeg::lpeg
++        lua-rapidjson::rapidjson
++        luajit::luajit_static
++        luasec::ssl
++        luasocket::luasocket
++        luasocket::mcore
++        luasocket::score
++        pthread
++        sqlite::sqlite3
++        turbo::tffi_wrap
++        xxhash::xxhash
++        xz::lzma_static
++        zlib::z
++        zstd::zstd
++        SOURCES switch/device.c switch/input.c switch/install.c switch/main.c
++    )
++
++    function(setup_koreader_switch)
++        find_program(PYTHON3 python3 REQUIRED)
++        set_target_properties(koreader-switch PROPERTIES
++            OUTPUT_NAME koreader
++            SUFFIX .elf
++            LINKER_LANGUAGE CXX
++        )
++        target_include_directories(koreader-switch PRIVATE ${BASE_DIR})
++        # NOTE: our compatibility shims (`libkoswitch`) & libnx are added to every
++        # link through a specs file (c.f., `SWITCH_SPECS` in `Makefile`).
++        set(COMPAT_LIB ${OUTPUT_DIR}/switch/libkoswitch.a)
++        target_link_options(koreader-switch PRIVATE -Wl,--wrap=fcntl,--wrap=getcwd,--wrap=_rmdir_r,--wrap=getaddrinfo,--start-group)
++        # Symbol table for LuaJIT's FFI & Lua C modules, c.f. `switch/gen_symtab.py`.
++        file(GLOB CDECLS ${BASE_DIR}/ffi-cdecl/*.c)
++        list(JOIN CDECLS "\n" CDECLS)
++        file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/koreader-switch.cdecls "${CDECLS}\n")
++        set(LAUNCHER
++            ${PYTHON3} ${BASE_DIR}/switch/gen_symtab.py
++            --nm ${CMAKE_NM}
++            --cdecls ${CMAKE_CURRENT_BINARY_DIR}/koreader-switch.cdecls
++            --extra-lib ${COMPAT_LIB}
++            --output ${CMAKE_CURRENT_BINARY_DIR}/koreader-switch-symtab.c
++            --
++        )
++        set_target_properties(koreader-switch PROPERTIES
++            C_LINKER_LAUNCHER "${LAUNCHER}"
++            CXX_LINKER_LAUNCHER "${LAUNCHER}"
++        )
++        set_property(TARGET koreader-switch APPEND PROPERTY LINK_DEPENDS ${BASE_DIR}/switch/gen_symtab.py ${COMPAT_LIB})
++    endfunction()
++
++endif()
++
++# }}}
++
+ # vim: foldmethod=marker foldlevel=0
+diff --git a/thirdparty/libk2pdfopt/CMakeLists.txt b/thirdparty/libk2pdfopt/CMakeLists.txt
+index faae6a82..af10486c 100644
+--- a/thirdparty/libk2pdfopt/CMakeLists.txt
++++ b/thirdparty/libk2pdfopt/CMakeLists.txt
+@@ -1,3 +1,8 @@
++if(SWITCH)
++    # Platform detection, and newlib compatibility.
++    list(APPEND PATCH_FILES switch.patch)
++endif()
++
+ if(NOT MONOLIBTIC)
+     set(CMAKE_PATCH_FILE ${CMAKE_BINARY_DIR}/k2pdfopt_exports.cmake)
+     target_exports(k2pdfopt FILELIST_VAR CDECLS_FILES WRITE_TO_FILE ${CMAKE_PATCH_FILE} CDECLS koptcontext_cdecl)
+@@ -22,6 +27,7 @@ endif()
+ external_project(
+     DOWNLOAD GIT 1fcffeb1e61ec43265d23e2ac77d9a901f8c45d2
+     https://github.com/koreader/libk2pdfopt.git
++    PATCH_FILES ${PATCH_FILES}
+     PATCH_COMMAND ${PATCH_CMD}
+     CMAKE_ARGS ${CMAKE_ARGS}
+     SOURCE_SUBDIR lib
+diff --git a/thirdparty/libk2pdfopt/switch.patch b/thirdparty/libk2pdfopt/switch.patch
+new file mode 100644
+index 00000000..cff1b59a
+--- /dev/null
++++ b/thirdparty/libk2pdfopt/switch.patch
+@@ -0,0 +1,70 @@
++diff -ru a/willuslib/string.c b/willuslib/string.c
++--- a/willuslib/string.c	2026-09-15 03:02:29
+++++ b/willuslib/string.c	2026-09-15 03:03:05
++@@ -366,6 +366,7 @@
++ /*
++ ** Convert string to all lower case
++ */
+++#ifndef __SWITCH__ /* Provided by newlib. */
++ void strlwr(char *s)
++ 
++     {
++@@ -373,6 +374,7 @@
++ 
++     for (i=0;s[i]!='\0';s[i]=tolower(s[i]),i++);
++     }
+++#endif
++ 
++ 
++ /*
++@@ -393,6 +395,7 @@
++ /*
++ ** Convert string to all upper case
++ */
+++#ifndef __SWITCH__ /* Provided by newlib. */
++ void strupr(char *s)
++ 
++     {
++@@ -400,6 +403,7 @@
++ 
++     for (i=0;s[i]!='\0';s[i]=toupper(s[i]),i++);
++     }
+++#endif
++ #endif /* NEEDSTRICMP */
++ 
++ 
++diff -ru a/willuslib/willus.h b/willuslib/willus.h
++--- a/willuslib/willus.h	2026-09-15 03:02:29
+++++ b/willuslib/willus.h	2026-09-15 03:03:05
++@@ -119,7 +119,7 @@
++ #define MINGW
++ #endif
++ 
++-#if (!defined(UNIX) && (defined(DJEMX) || defined(MINGW) || defined(CYGWIN32) || defined(unix) || defined(__unix) || defined(__MACH__)))
+++#if (!defined(UNIX) && (defined(__SWITCH__) || defined(DJEMX) || defined(MINGW) || defined(CYGWIN32) || defined(unix) || defined(__unix) || defined(__MACH__)))
++ #define UNIX
++ #endif
++ 
++@@ -195,7 +195,7 @@
++ #endif
++ #endif
++ 
++-#if (defined(__ANDROID__) || defined(__APPLE__))
+++#if (defined(__ANDROID__) || defined(__APPLE__) || defined(__SWITCH__))
++ #undef WILLUS_HAVE_FILE64
++ #endif
++ 
++@@ -772,9 +772,13 @@
++ int    get_pos_range (char *s,int *n1,int *n2);
++ #ifdef NEEDSTRICMP
++ int    stricmp       (const char *s1,const char *s2);
+++#ifndef __SWITCH__ /* Provided by newlib. */
++ void   strlwr        (char *s);
+++#endif
++ int    strnicmp      (const char *s1,const char *s2,int n);
+++#ifndef __SWITCH__ /* Provided by newlib. */
++ void   strupr        (char *s);
+++#endif
++ #endif
++ void pr_short_usage(char *progname,char *usage);
++ void decimal_string(char *s,double x,int ndigits,int signspace);
+diff --git a/thirdparty/libressl/CMakeLists.txt b/thirdparty/libressl/CMakeLists.txt
+index f9773ffb..a0f63456 100644
+--- a/thirdparty/libressl/CMakeLists.txt
++++ b/thirdparty/libressl/CMakeLists.txt
+@@ -2,6 +2,11 @@ list(APPEND PATCH_FILES cmake_tweaks.patch)
+ if(ANDROID)
+     list(APPEND PATCH_FILES android.patch)
+ endif()
++if(SWITCH)
++    # Horizon has neither `getauxval` nor `program_invocation_short_name`.
++    list(APPEND PATCH_CMD COMMAND ${ISED} "s|compat/getprogname_linux.c|compat/getprogname_unimpl.c|" crypto/CMakeLists.txt)
++    list(APPEND PATCH_CMD COMMAND ${ISED} "s|arch/aarch64/crypto_cpu_caps_linux.c|arch/aarch64/crypto_cpu_caps_none.c|" crypto/CMakeLists.txt)
++endif()
+ 
+ list(APPEND CMAKE_ARGS
+     -DCMAKE_TOOLCHAIN_FILE=${CMAKE_TOOLCHAIN_FILE}
+@@ -26,6 +31,7 @@ external_project(
+     https://cdn.openbsd.org/pub/OpenBSD/LibreSSL/libressl-4.3.2.tar.gz
+     https://cloudflare.cdn.openbsd.org/pub/OpenBSD/LibreSSL/libressl-4.3.2.tar.gz
+     PATCH_FILES ${PATCH_FILES}
++    PATCH_COMMAND ${PATCH_CMD}
+     CMAKE_ARGS ${CMAKE_ARGS}
+     BUILD_COMMAND ${BUILD_CMD}
+     INSTALL_COMMAND ${INSTALL_CMD}
+diff --git a/thirdparty/luajit/CMakeLists.txt b/thirdparty/luajit/CMakeLists.txt
+index bb8615a5..c4c7cc00 100644
+--- a/thirdparty/luajit/CMakeLists.txt
++++ b/thirdparty/luajit/CMakeLists.txt
+@@ -4,6 +4,10 @@ set(BINARY_DIR ${SOURCE_DIR})
+ list(APPEND PATCH_FILES koreader-luajit-makefile-tweaks.patch)
+ # Enable table.pack & table.unpack w/o the rest of the -DLUAJIT_ENABLE_LUA52COMPAT baggage...
+ list(APPEND PATCH_FILES koreader-luajit-enable-table_pack.patch)
++if(SWITCH)
++    # Static symbol resolution for `ffi.C` / `ffi.load`, PRNG seeding, `jit.os`.
++    list(APPEND PATCH_FILES koreader-luajit-switch.patch)
++endif()
+ 
+ if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+     # Debugging is a go!
+@@ -65,6 +69,13 @@ else()
+         list(APPEND BUILD_ARGS TARGET_SYS=Linux)
+     elseif(WIN32)
+         list(APPEND BUILD_ARGS TARGET_SYS=Windows)
++    elseif(SWITCH)
++        # No executable memory for machine code: interpreter only.
++        # And no real `mmap` either: LuaJIT's own allocator relies on unmapping parts of its
++        # segments, which the emulation (`switch/compat/mman.c`) can't do. Use `realloc`.
++        # Errors are unwound internally: the DWARF unwinder (frame registry, TLS exception object)
++        # isn't dependable on bare metal, and no C++ exceptions cross Lua frames in KOReader.
++        list(APPEND BUILD_ARGS TARGET_SYS=Other BUILDMODE=static "XCFLAGS=-DLUAJIT_DISABLE_JIT -DLUAJIT_USE_SYSMALLOC -DLUAJIT_UNWIND_INTERNAL")
+     endif()
+     list(APPEND BUILD_ARGS TARGET_STRIP=true)
+ endif()
+diff --git a/thirdparty/luajit/koreader-luajit-switch.patch b/thirdparty/luajit/koreader-luajit-switch.patch
+new file mode 100644
+index 00000000..e39106ae
+--- /dev/null
++++ b/thirdparty/luajit/koreader-luajit-switch.patch
+@@ -0,0 +1,89 @@
++diff --git a/src/lj_arch.h b/src/lj_arch.h
++index 7b7907e..f427e0a 100644
++--- a/src/lj_arch.h
+++++ b/src/lj_arch.h
++@@ -116,6 +116,8 @@
++ #define LJ_OS_NAME	"BSD"
++ #elif LUAJIT_OS == LUAJIT_OS_POSIX
++ #define LJ_OS_NAME	"POSIX"
+++#elif defined(__SWITCH__)
+++#define LJ_OS_NAME	"Switch"
++ #else
++ #define LJ_OS_NAME	"Other"
++ #endif
++diff --git a/src/lj_clib.c b/src/lj_clib.c
++index 283b6e4..e548cf8 100644
++--- a/src/lj_clib.c
+++++ b/src/lj_clib.c
++@@ -278,6 +278,46 @@ static void *clib_getsym(CLibrary *cl, const char *name)
++   return p;
++ }
++ 
+++#elif defined(__SWITCH__)
+++
+++/*
+++** Nintendo Switch homebrew: everything is statically linked into a single
+++** executable, and there is no dynamic loader. Every "library" maps onto the
+++** executable itself, and symbols are resolved through a lookup table that is
+++** generated at link time and provided by the embedder.
+++*/
+++#define CLIB_DEFHANDLE	((void *)(intptr_t)-1)
+++
+++/* Default: no symbols (e.g. for the standalone interpreter). */
+++__attribute__((weak)) void *lj_clib_static_lookup(const char *name)
+++{
+++  UNUSED(name);
+++  return NULL;
+++}
+++
+++LJ_NORET LJ_NOINLINE static void clib_error(lua_State *L, const char *fmt,
+++					    const char *name)
+++{
+++  lj_err_callermsg(L, lj_strfmt_pushf(L, fmt, name, "symbol not linked in"));
+++}
+++
+++static void *clib_loadlib(lua_State *L, const char *name, int global)
+++{
+++  UNUSED(L); UNUSED(name); UNUSED(global);
+++  return CLIB_DEFHANDLE;
+++}
+++
+++static void clib_unloadlib(CLibrary *cl)
+++{
+++  UNUSED(cl);
+++}
+++
+++static void *clib_getsym(CLibrary *cl, const char *name)
+++{
+++  UNUSED(cl);
+++  return lj_clib_static_lookup(name);
+++}
+++
++ #else
++ 
++ #define CLIB_DEFHANDLE	NULL
++diff --git a/src/lj_prng.c b/src/lj_prng.c
++index 6e5a992..ea1eb18 100644
++--- a/src/lj_prng.c
+++++ b/src/lj_prng.c
++@@ -91,6 +91,11 @@ extern int sceRandomGetRandomNumber(void *buf, size_t len);
++ 
++ #include <unistd.h>
++ 
+++#elif defined(__SWITCH__)
+++
+++/* Homebrew (libnx): provided by the embedder (backed by csrng). */
+++extern int getentropy(void *buf, size_t len);
+++
++ #elif LJ_TARGET_WINDOWS || LJ_TARGET_XBOXONE
++ 
++ #define WIN32_LEAN_AND_MEAN
++@@ -180,7 +185,7 @@ int LJ_FASTCALL lj_prng_seed_secure(PRNGState *rs)
++   if (sceRandomGetRandomNumber(rs->u, sizeof(rs->u)) == 0)
++     goto ok;
++ 
++-#elif LJ_TARGET_NX
+++#elif LJ_TARGET_NX || defined(__SWITCH__)
++ 
++   if (getentropy(rs->u, sizeof(rs->u)) == 0)
++     goto ok;

@@ -1,0 +1,824 @@
+diff --git a/frontend/device.lua b/frontend/device.lua
+index 6797b27..eb6ee83 100644
+--- a/frontend/device.lua
++++ b/frontend/device.lua
+@@ -18,6 +18,8 @@ local function probeDevice()
+             return require("device/remarkable/device")
+         elseif platform:sub(1, #"sony-prstux") == "sony-prstux" then
+             return require("device/sony-prstux/device")
++        elseif platform:sub(1, #"switch") == "switch" then
++            return require("device/switch/device")
+         end
+     end
+     if util.loadSDL3() then
+diff --git a/frontend/device/generic/device.lua b/frontend/device/generic/device.lua
+index be6c622..23d3236 100644
+--- a/frontend/device/generic/device.lua
++++ b/frontend/device/generic/device.lua
+@@ -156,6 +156,7 @@ local Device = {
+     isPocketBook = no,
+     isRemarkable = no,
+     isSonyPRSTUX = no,
++    isSwitch = no,
+     isSDL = no,
+     isEmulator = no,
+     isDesktop = no,
+diff --git a/frontend/device/input.lua b/frontend/device/input.lua
+index 33f3652..dcec97b 100644
+--- a/frontend/device/input.lua
++++ b/frontend/device/input.lua
+@@ -232,6 +232,8 @@ function Input:init()
+         self.gameControllerRumble = function(left_intensity, right_intensity, duration)
+             return self.input.gameControllerRumble(left_intensity, right_intensity, duration)
+         end
++    elseif self.device:isSwitch() then
++        self.input = require("ffi/input_switch")
+     elseif self.device:isAndroid() then
+         self.input = require("ffi/input_android")
+     elseif self.device:isPocketBook() then
+diff --git a/frontend/device/switch/device.lua b/frontend/device/switch/device.lua
+new file mode 100644
+index 0000000..a27d4e7
+--- /dev/null
++++ b/frontend/device/switch/device.lua
+@@ -0,0 +1,133 @@
++local Event = require("ui/event")
++local Generic = require("device/generic/device")
++local ffi = require("ffi")
++local logger = require("logger")
++local _ = require("gettext")
++local C = ffi.C
++
++require("ffi/switch_h")
++
++local UIManager
++
++local function yes() return true end
++local function no() return false end
++
++-- c.f., `SetSysProductModel` in libnx.
++local MODELS = {
++    [1] = { name = "Nintendo Switch", dpi = 237 },      -- Erista (6.2" LCD)
++    [3] = { name = "Nintendo Switch", dpi = 237 },      -- Mariko (6.2" LCD)
++    [4] = { name = "Nintendo Switch Lite", dpi = 267 }, -- Hoag (5.5" LCD)
++    [6] = { name = "Nintendo Switch OLED", dpi = 210 }, -- Aula (7" OLED)
++}
++local model = MODELS[C.ko_get_product_model()] or MODELS[1]
++
++local OPERATION_MODE_DOCKED = 1
++
++local Device = Generic:extend{
++    model = model.name,
++    display_dpi = model.dpi,
++    isSwitch = yes,
++    home_dir = "/",
++    hasBattery = yes,
++    -- Touch screen only: Joy-Con aren't needed (or used), so the UI behaves like on a Kobo.
++    hasKeys = no,
++    hasDPad = no,
++    isTouchDevice = yes,
++    hasMultitouch = yes,
++    hasColorScreen = yes,
++    hasEinkScreen = no,
++    hasFrontlight = yes,
++    hasWifiToggle = no,
++    hasSeamlessWifiToggle = no,
++    isDefaultFullscreen = yes,
++    needsScreenRefreshAfterResume = no,
++    canSuspend = no,
++    canStandby = no,
++    canPowerOff = no,
++    canReboot = no,
++    canRestart = yes,
++    -- There's no shell to run scripts with (and no way to spawn programs).
++    canExecuteScript = no,
++    -- SQLite's WAL mode needs shared memory mappings.
++    canUseWAL = no,
++}
++
++function Device:init()
++    self.screen = require("ffi/framebuffer_switch"):new{
++        device = self,
++        debug = logger.dbg,
++        -- The panel is landscape, but this is an e-reader: hold the console sideways
++        -- (turned clockwise, power button on the right).
++        is_always_portrait = true,
++    }
++    self.powerd = require("device/switch/powerd"):new{device = self}
++    self.input = require("device/input"):new{
++        device = self,
++        handleSdlEv = function(device_input, ev)
++            if ev.code == C.KO_SDL_QUIT then
++                -- Closed from the HOME menu: exit cleanly (saving the reading position, settings…).
++                logger.info("Switch: exit requested")
++                UIManager:broadcastEvent(Event:new("Close"))
++                UIManager:nextTick(function() UIManager:quit() end)
++            elseif ev.code == C.KO_SDL_OPERATION_MODE then
++                self:onOperationModeChanged(ev.value == OPERATION_MODE_DOCKED)
++            end
++        end,
++    }
++    -- Like the framebuffer, touch coordinates are in the panel's native (landscape) orientation.
++    self.input:registerEventAdjustHook(self.input.adjustTouchSwitchAxesAndMirrorX, self.screen:getScreenWidth() - 1)
++
++    -- Reading involves long stretches without input: don't let the console dim the screen or go to sleep.
++    C.ko_set_auto_sleep_inhibited(1)
++
++    Generic.init(self)
++end
++
++function Device:onOperationModeChanged(docked)
++    -- A TV can't be turned sideways: use landscape while docked, and restore the previous rotation afterwards.
++    if docked then
++        self.handheld_rotation_mode = self.screen:getRotationMode()
++        UIManager:broadcastEvent(Event:new("SetRotationMode", self.screen.DEVICE_ROTATED_COUNTER_CLOCKWISE))
++    elseif self.handheld_rotation_mode then
++        UIManager:broadcastEvent(Event:new("SetRotationMode", self.handheld_rotation_mode))
++        self.handheld_rotation_mode = nil
++    end
++end
++
++function Device:UIManagerReady(uimgr)
++    UIManager = uimgr
++    if C.ko_get_operation_mode() == OPERATION_MODE_DOCKED then
++        UIManager:nextTick(function() self:onOperationModeChanged(true) end)
++    end
++    if C.ko_is_applet_mode() ~= 0 then
++        UIManager:scheduleIn(1, function()
++            local InfoMessage = require("ui/widget/infomessage")
++            UIManager:show(InfoMessage:new{
++                text = _("KOReader is running in applet mode, with limited memory: large documents may fail to open.\n\nFor best results, set up Atmosphère to open the Homebrew Menu when starting a game, and launch KOReader from there."),
++                timeout = 10,
++            })
++        end)
++    end
++end
++
++function Device:initNetworkManager(NetworkMgr)
++    function NetworkMgr:isWifiOn() return true end
++    function NetworkMgr:isConnected()
++        return C.ko_is_network_connected() ~= 0
++    end
++end
++
++function Device:retrieveNetworkInfo()
++    -- Network interfaces are managed by the system (no getifaddrs / raw sockets for homebrew).
++    if C.ko_is_network_connected() ~= 0 then
++        return _("Connected to the internet (network settings are managed by the console).")
++    end
++    return _("Not connected (network settings are managed by the console).")
++end
++
++function Device:exit()
++    C.ko_set_auto_sleep_inhibited(0)
++    Generic.exit(self)
++end
++
++return Device
+diff --git a/frontend/device/switch/powerd.lua b/frontend/device/switch/powerd.lua
+new file mode 100644
+index 0000000..8a3ba38
+--- /dev/null
++++ b/frontend/device/switch/powerd.lua
+@@ -0,0 +1,43 @@
++local BasePowerD = require("device/generic/powerd")
++local ffi = require("ffi")
++local C = ffi.C
++
++require("ffi/switch_h")
++
++local SwitchPowerD = BasePowerD:new{
++    fl_min = 0,
++    fl_max = 100,
++}
++
++function SwitchPowerD:frontlightIntensityHW()
++    local brightness = C.ko_get_brightness()
++    if brightness < 0 then
++        return self.fl_max
++    end
++    return math.floor(brightness * self.fl_max + 0.5)
++end
++
++function SwitchPowerD:setIntensityHW(intensity)
++    -- NOTE: the backlight can't be turned off, 0 is just the dimmest setting.
++    C.ko_set_brightness(intensity / self.fl_max)
++    self:_decideFrontlightState()
++end
++
++function SwitchPowerD:getCapacityHW()
++    local capacity = C.ko_get_battery_percentage()
++    if capacity >= 0 then
++        self.last_capacity = capacity
++    end
++    -- If the battery service hiccups, keep the last known level (rather than report an empty battery).
++    return self.last_capacity or 100
++end
++
++function SwitchPowerD:isChargingHW()
++    return C.ko_is_charging() ~= 0
++end
++
++function SwitchPowerD:isChargedHW()
++    return self:isChargingHW() and self:getCapacityHW() >= 100
++end
++
++return SwitchPowerD
+diff --git a/frontend/ui/trapper.lua b/frontend/ui/trapper.lua
+index ee64b46..44d0188 100644
+--- a/frontend/ui/trapper.lua
++++ b/frontend/ui/trapper.lua
+@@ -503,6 +503,43 @@ function Trapper:dismissableRunInSubprocess(task, trap_widget_or_string, task_re
+         logger.warn("unwrapped dismissableRunInSubprocess(), falling back to blocking in-process run")
+         return true, task()
+     end
++    if not ffiutil.isSubProcessSupported() then
++        -- No subprocesses on this platform: run the task in-process (it can't be dismissed).
++        local widget
++        if type(trap_widget_or_string) == "string" then
++            widget = TrapWidget:new{
++                text = trap_widget_or_string,
++            }
++            UIManager:show(widget)
++            UIManager:forceRePaint()
++        end
++        local results = table.pack(xpcall(task, debug.traceback))
++        if widget then
++            UIManager:close(widget)
++            UIManager:forceRePaint()
++        end
++        -- The UI was blocked meanwhile: drop the taps that piled up.
++        require("device").input:inhibitInputUntil(true)
++        -- Same results as with a subprocess: nothing if the task failed (like a crashed subprocess), or returned no output.
++        if not results[1] then
++            logger.warn("in-process task failed:", results[2])
++            return true
++        end
++        if task_returns_simple_string then
++            local result = results[2]
++            if type(result) ~= "string" then
++                if result ~= nil then
++                    logger.warn("returned value from task is not a string:", result)
++                end
++                return true
++            end
++            if result == "" then
++                return true
++            end
++            return true, result
++        end
++        return true, unpack(results, 2, results.n)
++    end
+ 
+     local trap_widget
+     local own_trap_widget = false
+diff --git a/make/switch.mk b/make/switch.mk
+new file mode 100644
+index 0000000..cb1c01b
+--- /dev/null
++++ b/make/switch.mk
+@@ -0,0 +1,84 @@
++SWITCH_DIR = $(PLATFORM_DIR)/switch
++SWITCH_NRO = koreader-switch$(KODEDUG_SUFFIX)-$(VERSION).nro
++SWITCH_ROMFS = $(INSTALL_DIR)/romfs
++SWITCH_NACP = $(INSTALL_DIR)/koreader.nacp
++# NOTE: the NACP version field is limited to 16 characters (e.g. `v2026.07.2-161`).
++SWITCH_NACP_VERSION = $(subst $(space),-,$(wordlist 1,2,$(subst -, ,$(VERSION))))
++
++SWITCH_NSP = koreader-switch$(KODEDUG_SUFFIX)-$(VERSION).nsp
++SWITCH_NSP_DIR = $(INSTALL_DIR)/nsp
++# "KOREAD", in the application title ID range.
++SWITCH_TITLE_ID = 01004B4F52454144
++SWITCH_LANGUAGES = AmericanEnglish BritishEnglish Japanese French German LatinAmericanSpanish Spanish Italian \
++	Dutch CanadianFrench Portuguese Russian Korean TraditionalChinese SimplifiedChinese BrazilianPortuguese
++
++# Not useful / not supported on the Switch.
++define UPDATE_PATH_EXCLUDES +=
++koreader.elf
++switch
++plugins/SSH.koplugin
++plugins/autofrontlight.koplugin
++plugins/autowarmth.koplugin
++plugins/externalkeyboard.koplugin
++plugins/hello.koplugin
++plugins/terminal.koplugin
++plugins/timesync.koplugin
++tools
++endef
++
++# Update. {{{
++
++# The whole KOReader tree is embedded in the NRO's RomFS, and installed to
++# `/switch/koreader` on the SD card on first launch (c.f., `base/switch/main.c`).
++update: all
++	rm -rf $(SWITCH_ROMFS)
++	mkdir -p $(SWITCH_ROMFS)/koreader
++	rsync -a --copy-links \
++		$(foreach p,$(UPDATE_PATH_EXCLUDES),--exclude='/$p') \
++		$(foreach p,$(UPDATE_GLOBAL_EXCLUDES),--exclude='$p') \
++		$(INSTALL_DIR)/koreader/ $(SWITCH_ROMFS)/koreader/
++	# Identifies the embedded tree, so the launcher reinstalls it whenever it changes (c.f., `base/switch/install.c`).
++	cd $(SWITCH_ROMFS)/koreader && find . -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum | sha256sum | cut -d' ' -f1 > ../install-id
++	mv $(SWITCH_ROMFS)/install-id $(SWITCH_ROMFS)/koreader/.install-id
++	nacptool --create 'KOReader' 'KOReader community' '$(SWITCH_NACP_VERSION)' $(SWITCH_NACP)
++	elf2nro $(INSTALL_DIR)/koreader/koreader.elf $(SWITCH_NRO) \
++		--icon=$(SWITCH_DIR)/icon.jpg \
++		--nacp=$(SWITCH_NACP) \
++		--romfsdir=$(SWITCH_ROMFS)
++
++PHONY += update
++
++# }}}
++
++# Installable title (NSP). {{{
++
++# The same program, as an application with the RomFS inside: it gets its own HOME menu
++# icon, and a game's full memory. Building one needs hacbrewpack and the keys dumped from
++# your own console: `make TARGET=switch nsp SWITCH_KEYS=/path/to/prod.keys`.
++# NOTE: hacbrewpack only needs two of those keys, and rejects some entries of recent
++# keysets: it gets a private copy of just those two, removed right after.
++nsp: update
++	$(if $(SWITCH_KEYS),,$(error SWITCH_KEYS must point to the prod.keys dumped from your console))
++	rm -rf $(SWITCH_NSP_DIR)
++	mkdir -p $(SWITCH_NSP_DIR)/exefs $(SWITCH_NSP_DIR)/control
++	elf2nso $(INSTALL_DIR)/koreader/koreader.elf $(SWITCH_NSP_DIR)/exefs/main
++	npdmtool $(SWITCH_DIR)/koreader.json $(SWITCH_NSP_DIR)/exefs/main.npdm
++	nacptool --create 'KOReader' 'KOReader community' '$(SWITCH_NACP_VERSION)' \
++		$(SWITCH_NSP_DIR)/control/control.nacp --titleid=$(SWITCH_TITLE_ID)
++	$(SWITCH_DIR)/nsp_nacp.py $(SWITCH_NSP_DIR)/control/control.nacp
++	for lang in $(SWITCH_LANGUAGES); do cp $(SWITCH_DIR)/icon.jpg $(SWITCH_NSP_DIR)/control/icon_$$lang.dat; done
++	umask 077 && grep -E '^[[:space:]]*(header_key|key_area_key_application_00)[[:space:]]*=' '$(SWITCH_KEYS)' \
++		> $(SWITCH_NSP_DIR)/keys.txt || { echo "$(SWITCH_KEYS): no header_key / key_area_key_application_00" >&2; exit 1; }
++	hacbrewpack --keyset $(SWITCH_NSP_DIR)/keys.txt \
++		--titleid $(SWITCH_TITLE_ID) --titlename 'KOReader' --titlepublisher 'KOReader community' \
++		--exefsdir $(SWITCH_NSP_DIR)/exefs --romfsdir $(SWITCH_ROMFS) --controldir $(SWITCH_NSP_DIR)/control --nologo \
++		--tempdir $(SWITCH_NSP_DIR)/temp --ncadir $(SWITCH_NSP_DIR)/nca --backupdir $(SWITCH_NSP_DIR)/backup \
++		--nspdir $(SWITCH_NSP_DIR)/out; \
++		status=$$?; rm -f $(SWITCH_NSP_DIR)/keys.txt; exit $$status
++	mv $(SWITCH_NSP_DIR)/out/*.nsp $(SWITCH_NSP)
++
++PHONY += nsp
++
++# }}}
++
++# vim: foldmethod=marker foldlevel=0
+diff --git a/platform/switch/icon.jpg b/platform/switch/icon.jpg
+new file mode 100644
+index 0000000000000000000000000000000000000000..544ab43283fb0872b4e0581525fa6b0c8f4fea7d
+GIT binary patch
+literal 12047
+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
+NNq9<1;ZPH&{s&eSMuY$W
+
+literal 0
+HcmV?d00001
+
+diff --git a/platform/switch/koreader.json b/platform/switch/koreader.json
+new file mode 100644
+index 0000000..c46ad67
+--- /dev/null
++++ b/platform/switch/koreader.json
+@@ -0,0 +1,175 @@
++{
++    "name": "KOReader",
++    "program_id": "0x01004B4F52454144",
++    "program_id_range_min": "0x01004B4F52454144",
++    "program_id_range_max": "0x01004B4F52454144",
++    "main_thread_stack_size": "0x100000",
++    "main_thread_priority": 44,
++    "default_cpu_id": 0,
++    "version": 0,
++    "pool_partition": 0,
++    "is_64_bit": true,
++    "address_space_type": 3,
++    "is_retail": true,
++    "filesystem_access": {
++        "permissions": "0xFFFFFFFFFFFFFFFF"
++    },
++    "service_host": [
++        "*"
++    ],
++    "service_access": [
++        "*"
++    ],
++    "kernel_capabilities": [
++        {
++            "type": "kernel_flags",
++            "value": {
++                "highest_thread_priority": 59,
++                "lowest_thread_priority": 28,
++                "highest_cpu_id": 2,
++                "lowest_cpu_id": 0
++            }
++        },
++        {
++            "type": "syscalls",
++            "value": {
++                "svcSetHeapSize": "0x01",
++                "svcSetMemoryPermission": "0x02",
++                "svcSetMemoryAttribute": "0x03",
++                "svcMapMemory": "0x04",
++                "svcUnmapMemory": "0x05",
++                "svcQueryMemory": "0x06",
++                "svcExitProcess": "0x07",
++                "svcCreateThread": "0x08",
++                "svcStartThread": "0x09",
++                "svcExitThread": "0x0A",
++                "svcSleepThread": "0x0B",
++                "svcGetThreadPriority": "0x0C",
++                "svcSetThreadPriority": "0x0D",
++                "svcGetThreadCoreMask": "0x0E",
++                "svcSetThreadCoreMask": "0x0F",
++                "svcGetCurrentProcessorNumber": "0x10",
++                "svcSignalEvent": "0x11",
++                "svcClearEvent": "0x12",
++                "svcMapSharedMemory": "0x13",
++                "svcUnmapSharedMemory": "0x14",
++                "svcCreateTransferMemory": "0x15",
++                "svcCloseHandle": "0x16",
++                "svcResetSignal": "0x17",
++                "svcWaitSynchronization": "0x18",
++                "svcCancelSynchronization": "0x19",
++                "svcArbitrateLock": "0x1A",
++                "svcArbitrateUnlock": "0x1B",
++                "svcWaitProcessWideKeyAtomic": "0x1C",
++                "svcSignalProcessWideKey": "0x1D",
++                "svcGetSystemTick": "0x1E",
++                "svcConnectToNamedPort": "0x1F",
++                "svcSendSyncRequestLight": "0x20",
++                "svcSendSyncRequest": "0x21",
++                "svcSendSyncRequestWithUserBuffer": "0x22",
++                "svcSendAsyncRequestWithUserBuffer": "0x23",
++                "svcGetProcessId": "0x24",
++                "svcGetThreadId": "0x25",
++                "svcBreak": "0x26",
++                "svcOutputDebugString": "0x27",
++                "svcReturnFromException": "0x28",
++                "svcGetInfo": "0x29",
++                "svcFlushEntireDataCache": "0x2A",
++                "svcFlushDataCache": "0x2B",
++                "svcMapPhysicalMemory": "0x2C",
++                "svcUnmapPhysicalMemory": "0x2D",
++                "svcGetDebugFutureThreadInfo": "0x2E",
++                "svcGetLastThreadInfo": "0x2F",
++                "svcGetResourceLimitLimitValue": "0x30",
++                "svcGetResourceLimitCurrentValue": "0x31",
++                "svcSetThreadActivity": "0x32",
++                "svcGetThreadContext3": "0x33",
++                "svcWaitForAddress": "0x34",
++                "svcSignalToAddress": "0x35",
++                "svcSynchronizePreemptionState": "0x36",
++                "svcGetResourceLimitPeakValue": "0x37",
++                "svcCreateIoPool": "0x39",
++                "svcCreateIoRegion": "0x3A",
++                "svcKernelDebug": "0x3C",
++                "svcChangeKernelTraceState": "0x3D",
++                "svcCreateSession": "0x40",
++                "svcAcceptSession": "0x41",
++                "svcReplyAndReceiveLight": "0x42",
++                "svcReplyAndReceive": "0x43",
++                "svcReplyAndReceiveWithUserBuffer": "0x44",
++                "svcCreateEvent": "0x45",
++                "svcMapIoRegion": "0x46",
++                "svcUnmapIoRegion": "0x47",
++                "svcMapPhysicalMemoryUnsafe": "0x48",
++                "svcUnmapPhysicalMemoryUnsafe": "0x49",
++                "svcSetUnsafeLimit": "0x4A",
++                "svcCreateCodeMemory": "0x4B",
++                "svcControlCodeMemory": "0x4C",
++                "svcSleepSystem": "0x4D",
++                "svcReadWriteRegister": "0x4E",
++                "svcSetProcessActivity": "0x4F",
++                "svcCreateSharedMemory": "0x50",
++                "svcMapTransferMemory": "0x51",
++                "svcUnmapTransferMemory": "0x52",
++                "svcCreateInterruptEvent": "0x53",
++                "svcQueryPhysicalAddress": "0x54",
++                "svcQueryIoMapping": "0x55",
++                "svcCreateDeviceAddressSpace": "0x56",
++                "svcAttachDeviceAddressSpace": "0x57",
++                "svcDetachDeviceAddressSpace": "0x58",
++                "svcMapDeviceAddressSpaceByForce": "0x59",
++                "svcMapDeviceAddressSpaceAligned": "0x5A",
++                "svcMapDeviceAddressSpace": "0x5B",
++                "svcUnmapDeviceAddressSpace": "0x5C",
++                "svcInvalidateProcessDataCache": "0x5D",
++                "svcStoreProcessDataCache": "0x5E",
++                "svcFlushProcessDataCache": "0x5F",
++                "svcDebugActiveProcess": "0x60",
++                "svcBreakDebugProcess": "0x61",
++                "svcTerminateDebugProcess": "0x62",
++                "svcGetDebugEvent": "0x63",
++                "svcContinueDebugEvent": "0x64",
++                "svcGetProcessList": "0x65",
++                "svcGetThreadList": "0x66",
++                "svcGetDebugThreadContext": "0x67",
++                "svcSetDebugThreadContext": "0x68",
++                "svcQueryDebugProcessMemory": "0x69",
++                "svcReadDebugProcessMemory": "0x6A",
++                "svcWriteDebugProcessMemory": "0x6B",
++                "svcSetHardwareBreakPoint": "0x6C",
++                "svcGetDebugThreadParam": "0x6D",
++                "svcGetSystemInfo": "0x6F",
++                "svcCreatePort": "0x70",
++                "svcManageNamedPort": "0x71",
++                "svcConnectToPort": "0x72",
++                "svcSetProcessMemoryPermission": "0x73",
++                "svcMapProcessMemory": "0x74",
++                "svcUnmapProcessMemory": "0x75",
++                "svcQueryProcessMemory": "0x76",
++                "svcMapProcessCodeMemory": "0x77",
++                "svcUnmapProcessCodeMemory": "0x78",
++                "svcCreateProcess": "0x79",
++                "svcStartProcess": "0x7A",
++                "svcTerminateProcess": "0x7B",
++                "svcGetProcessInfo": "0x7C",
++                "svcCreateResourceLimit": "0x7D",
++                "svcSetResourceLimitLimitValue": "0x7E",
++                "svcCallSecureMonitor": "0x7F",
++                "svcMapInsecureMemory": "0x90",
++                "svcUnmapInsecureMemory": "0x91"
++            }
++        },
++        {
++            "type": "application_type",
++            "value": 1
++        },
++        {
++            "type": "min_kernel_version",
++            "value": "0x30"
++        },
++        {
++            "type": "handle_table_size",
++            "value": 1023
++        }
++    ]
++}
+diff --git a/platform/switch/nsp_nacp.py b/platform/switch/nsp_nacp.py
+new file mode 100755
+index 0000000..ae4a18c
+--- /dev/null
++++ b/platform/switch/nsp_nacp.py
+@@ -0,0 +1,43 @@
++#!/usr/bin/env python3
++"""
++Adjust a `nacptool --create` NACP for KOReader's installable title (NSP).
++
++nacptool's defaults target NROs, whose NACP is mostly ignored. The HOME menu
++honors an installed title's NACP, so:
++- don't ask to pick a user account on launch (KOReader has no save data);
++- don't reserve user save data;
++- declare every language (the NSP ships the icon for each of them), with the
++  title and publisher set for all of them (nacptool and hacbrewpack only fill
++  the first 12 entries);
++- let the system dismiss the (absent) startup logo by itself.
++"""
++
++import struct
++import sys
++
++LANGUAGE_COUNT = 16
++TITLE_ENTRY_SIZE = 0x300  # name (0x200) + publisher (0x100)
++STARTUP_USER_ACCOUNT = 0x3025
++SUPPORTED_LANGUAGE_FLAG = 0x302C
++USER_ACCOUNT_SAVE_DATA_SIZE = 0x3080
++USER_ACCOUNT_SAVE_DATA_JOURNAL_SIZE = 0x3088
++LOGO_HANDLING = 0x30F1
++
++path = sys.argv[1]
++with open(path, "rb") as f:
++    nacp = bytearray(f.read())
++if len(nacp) != 0x4000:
++    sys.exit("%s: not a NACP" % path)
++
++for i in range(1, LANGUAGE_COUNT):
++    entry = i * TITLE_ENTRY_SIZE
++    if nacp[entry] == 0:
++        nacp[entry:entry + TITLE_ENTRY_SIZE] = nacp[0:TITLE_ENTRY_SIZE]
++nacp[STARTUP_USER_ACCOUNT] = 0  # None
++struct.pack_into("<Q", nacp, USER_ACCOUNT_SAVE_DATA_SIZE, 0)
++struct.pack_into("<Q", nacp, USER_ACCOUNT_SAVE_DATA_JOURNAL_SIZE, 0)
++struct.pack_into("<I", nacp, SUPPORTED_LANGUAGE_FLAG, 0xFFFF)
++nacp[LOGO_HANDLING] = 0  # Auto
++
++with open(path, "wb") as f:
++    f.write(nacp)

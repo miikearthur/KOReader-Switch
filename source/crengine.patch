@@ -1,0 +1,22 @@
+diff --git a/crengine/src/lvmemman.cpp b/crengine/src/lvmemman.cpp
+index cdffbbe..07fc6a6 100644
+--- a/crengine/src/lvmemman.cpp
++++ b/crengine/src/lvmemman.cpp
+@@ -32,7 +32,7 @@ void crSetFileToRemoveOnFatalError(const char * filename) {
+ 	strcpy(file_to_remove_on_crash, filename == NULL ? "" : filename); // NOLINT
+ }
+ 
+-#ifdef _LINUX
++#if defined(_LINUX) && !defined(__SWITCH__)
+ static struct sigaction old_sa[NSIG];
+ 
+ void cr_sigaction(int signal, siginfo_t *info, void *reserved)
+@@ -47,7 +47,7 @@ void cr_sigaction(int signal, siginfo_t *info, void *reserved)
+ static bool signals_are_set = false;
+ void crSetSignalHandler()
+ {
+-#ifdef _LINUX
++#if defined(_LINUX) && !defined(__SWITCH__)
+ 	if (signals_are_set)
+ 		return;
+ 	signals_are_set = true;

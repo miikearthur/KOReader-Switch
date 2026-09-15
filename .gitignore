@@ -1,0 +1,3 @@
+# Built artifacts are attached to GitHub Releases, not committed (too large for git).
+*.nro
+*.nsp
