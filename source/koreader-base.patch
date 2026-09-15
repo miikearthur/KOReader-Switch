@@ -2637,6 +2637,53 @@ index 00000000..749ee2a5
 +    }
 +    return total;
 +}
+diff --git a/switch/compat/rename.c b/switch/compat/rename.c
+new file mode 100644
+index 00000000..683f4ca9
+--- /dev/null
++++ b/switch/compat/rename.c
+@@ -0,0 +1,41 @@
++/*
++    File rename: emulate the POSIX "replace an existing destination" semantics that KOReader and its
++    plugins rely on. Horizon's filesystem refuses to rename onto an existing path (fsFsRenameFile
++    reports an error that surfaces as EEXIST), so a plain rename() over an existing file fails. That
++    breaks the ubiquitous atomic-save pattern of writing a temp file and renaming it over the target
++    (e.g. LuaSettings, and BookOrbit's sync-state flush and post-download bookkeeping).
++
++    We wrap newlib's reentrant `_rename_r`, the single chokepoint: the public `rename()` calls it,
++    and so does an FFI `C.rename`. Only a failure whose destination is an existing plain file is
++    recovered, and only when the source itself still exists, so a rename that failed for any other
++    reason never deletes whatever sits at the target. This is best-effort rather than atomic -- FAT
++    cannot replace atomically anyway -- but it restores the behaviour callers expect.
++    (Wired in with `-Wl,--wrap=_rename_r`.)
++*/
++
++#include <errno.h>
++#include <reent.h>
++#include <stdio.h>
++#include <string.h>
++#include <sys/stat.h>
++
++int __real__rename_r(struct _reent *r, const char *old, const char *new);
++
++int __wrap__rename_r(struct _reent *r, const char *old, const char *new)
++{
++    int ret = __real__rename_r(r, old, new);
++    if (ret == 0 || strcmp(old, new) == 0) {
++        return ret;
++    }
++
++    /* Recover only from "the destination already exists": require the source to be present and the
++       destination to be a plain file, so an unrelated failure can never destroy the target. */
++    struct stat src_st, dst_st;
++    if (stat(old, &src_st) == 0 && stat(new, &dst_st) == 0 && !S_ISDIR(dst_st.st_mode)) {
++        if (remove(new) == 0) {
++            r->_errno = 0;
++            ret = __real__rename_r(r, old, new);
++        }
++    }
++    return ret;
++}
 diff --git a/switch/compat/rmdir.c b/switch/compat/rmdir.c
 new file mode 100644
 index 00000000..bef2dd15
@@ -5007,7 +5054,7 @@ index 00000000..8b277f0d
 @@ -0,0 +1 @@
 +!<arch>
 diff --git a/thirdparty/cmake_modules/koreader_targets.cmake b/thirdparty/cmake_modules/koreader_targets.cmake
-index 00e95b66..2d58eb9c 100644
+index 00e95b66..37394378 100644
 --- a/thirdparty/cmake_modules/koreader_targets.cmake
 +++ b/thirdparty/cmake_modules/koreader_targets.cmake
 @@ -76,7 +76,7 @@ endfunction()
@@ -5105,7 +5152,7 @@ index 00e95b66..2d58eb9c 100644
 +        # NOTE: our compatibility shims (`libkoswitch`) & libnx are added to every
 +        # link through a specs file (c.f., `SWITCH_SPECS` in `Makefile`).
 +        set(COMPAT_LIB ${OUTPUT_DIR}/switch/libkoswitch.a)
-+        target_link_options(koreader-switch PRIVATE -Wl,--wrap=fcntl,--wrap=getcwd,--wrap=_rmdir_r,--wrap=getaddrinfo,--start-group)
++        target_link_options(koreader-switch PRIVATE -Wl,--wrap=fcntl,--wrap=getcwd,--wrap=_rmdir_r,--wrap=_rename_r,--wrap=getaddrinfo,--start-group)
 +        # Symbol table for LuaJIT's FFI & Lua C modules, c.f. `switch/gen_symtab.py`.
 +        file(GLOB CDECLS ${BASE_DIR}/ffi-cdecl/*.c)
 +        list(JOIN CDECLS "\n" CDECLS)
