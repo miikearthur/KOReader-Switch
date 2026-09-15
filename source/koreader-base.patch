@@ -997,10 +997,10 @@ index 00000000..a8affe05
 +cdecl_func(dirname)
 diff --git a/ffi/framebuffer_switch.lua b/ffi/framebuffer_switch.lua
 new file mode 100644
-index 00000000..d3ad11e1
+index 00000000..776cdb1a
 --- /dev/null
 +++ b/ffi/framebuffer_switch.lua
-@@ -0,0 +1,66 @@
+@@ -0,0 +1,77 @@
 +--[[--
 +Framebuffer implementation for Nintendo Switch homebrew (libnx).
 +
@@ -1022,6 +1022,7 @@ index 00000000..d3ad11e1
 +local framebuffer = {
 +    painting = false,
 +    dirty = false,
++    hw_nightmode = false,
 +}
 +
 +function framebuffer:init()
@@ -1034,13 +1035,23 @@ index 00000000..d3ad11e1
 +    framebuffer.parent.init(self)
 +end
 +
++-- Night mode is done at scan-out (a full-frame XOR in ko_fb_present), so the device advertises
++-- canHWInvert and KOReader keeps drawing normal, non-inverted pixels. That matters for speed: the
++-- software-inversion path (dest buffer flagged inverse, sources not) bypasses the C blitter and falls
++-- back to a per-pixel Lua blit, which is punishingly slow without LuaJIT's JIT.
++function framebuffer:setHWNightmode(toggle)
++    self.hw_nightmode = toggle and true or false
++end
++
++function framebuffer:getHWNightmode()
++    return self.hw_nightmode
++end
++
 +function framebuffer:_present()
 +    self.dirty = false
 +    local bb = self.full_bb or self.bb
 +    -- Rotation is just a view: the memory is always laid out in the panel's native orientation.
-+    -- Inversion (night mode) is ignored by the C blitter, so it's applied when presenting (like on Android).
-+    local invert = bb:getInverse() == 1 and BB:getUseCBB()
-+    C.ko_fb_present(ffi.cast("const uint8_t *", bb.data), bb.pixel_stride, invert and 1 or 0)
++    C.ko_fb_present(ffi.cast("const uint8_t *", bb.data), bb.pixel_stride, self.hw_nightmode and 1 or 0)
 +end
 +
 +-- The whole frame is presented at once, so coalesce the refreshes of a paint batch.

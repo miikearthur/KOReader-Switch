@@ -38,10 +38,10 @@ index 33f3652..dcec97b 100644
      elseif self.device:isPocketBook() then
 diff --git a/frontend/device/switch/device.lua b/frontend/device/switch/device.lua
 new file mode 100644
-index 0000000..e33038e
+index 0000000..afe9f0b
 --- /dev/null
 +++ b/frontend/device/switch/device.lua
-@@ -0,0 +1,144 @@
+@@ -0,0 +1,148 @@
 +local Event = require("ui/event")
 +local Generic = require("device/generic/device")
 +local ffi = require("ffi")
@@ -81,6 +81,10 @@ index 0000000..e33038e
 +    hasMultitouch = yes,
 +    hasColorScreen = yes,
 +    hasEinkScreen = no,
++    -- Night mode inverts the whole frame at scan-out (ko_fb_present), so let KOReader treat it as
++    -- hardware inversion: it keeps drawing normal pixels (fast C blitter) instead of the slow
++    -- per-pixel software-inversion blit, which has no JIT to lean on here.
++    canHWInvert = yes,
 +    -- Auto-rotation from the accelerometer (Switch Lite always; regular/OLED only with Joy-Con attached).
 +    -- KOReader's rotation menu, manual orientation and lock work regardless.
 +    hasGSensor = yes,
