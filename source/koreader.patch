@@ -38,10 +38,10 @@ index 33f3652..dcec97b 100644
      elseif self.device:isPocketBook() then
 diff --git a/frontend/device/switch/device.lua b/frontend/device/switch/device.lua
 new file mode 100644
-index 0000000..ab132e9
+index 0000000..e33038e
 --- /dev/null
 +++ b/frontend/device/switch/device.lua
-@@ -0,0 +1,145 @@
+@@ -0,0 +1,144 @@
 +local Event = require("ui/event")
 +local Generic = require("device/generic/device")
 +local ffi = require("ffi")
@@ -104,9 +104,8 @@ index 0000000..ab132e9
 +    self.screen = require("ffi/framebuffer_switch"):new{
 +        device = self,
 +        debug = logger.dbg,
-+        -- The panel is landscape, but this is an e-reader: hold the console sideways
-+        -- (turned clockwise, power button on the right).
-+        is_always_portrait = true,
++        -- Boot in the panel's native landscape orientation; the user rotates to portrait
++        -- with the accelerometer or the rotation menu (and can lock it there).
 +    }
 +    self.powerd = require("device/switch/powerd"):new{device = self}
 +    self.input = require("device/input"):new{
@@ -122,8 +121,8 @@ index 0000000..ab132e9
 +            end
 +        end,
 +    }
-+    -- Like the framebuffer, touch coordinates are in the panel's native (landscape) orientation.
-+    self.input:registerEventAdjustHook(self.input.adjustTouchSwitchAxesAndMirrorX, self.screen:getScreenWidth() - 1)
++    -- Touch coordinates arrive in the panel's native (landscape) orientation, which now matches the
++    -- framebuffer's, so no axis swap is needed here; KOReader rotates them per the current rotation mode.
 +
 +    -- Accelerometer rotation: the native glue emits EV_MSC/MSC_GYRO; route it to the standard gyro
 +    -- handler (Generic.init turns handleGyroEv into handleMiscGyroEv unless the user disabled it).
@@ -140,10 +139,10 @@ index 0000000..ab132e9
 +end
 +
 +function Device:onOperationModeChanged(docked)
-+    -- A TV can't be turned sideways: use landscape while docked, and restore the previous rotation afterwards.
++    -- A TV can't be turned sideways: use upright landscape while docked, and restore the previous rotation afterwards.
 +    if docked then
 +        self.handheld_rotation_mode = self.screen:getRotationMode()
-+        UIManager:broadcastEvent(Event:new("SetRotationMode", self.screen.DEVICE_ROTATED_COUNTER_CLOCKWISE))
++        UIManager:broadcastEvent(Event:new("SetRotationMode", self.screen.DEVICE_ROTATED_UPRIGHT))
 +    elseif self.handheld_rotation_mode then
 +        UIManager:broadcastEvent(Event:new("SetRotationMode", self.handheld_rotation_mode))
 +        self.handheld_rotation_mode = nil

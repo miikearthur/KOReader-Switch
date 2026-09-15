@@ -4526,10 +4526,10 @@ index 00000000..fa87350b
 +#endif
 diff --git a/switch/main.c b/switch/main.c
 new file mode 100644
-index 00000000..41150d70
+index 00000000..83f2ecc3
 --- /dev/null
 +++ b/switch/main.c
-@@ -0,0 +1,463 @@
+@@ -0,0 +1,451 @@
 +/*
 +    KOReader for Nintendo Switch: application entry point.
 +
@@ -4663,28 +4663,16 @@ index 00000000..41150d70
 +    draw_text(text, (screen_width - width) / 2, y, scale, portrait, rgb);
 +}
 +
-+static void show_screen(const char *portrait_status, const char *landscape_title, const char *landscape_text)
++/* The splash is drawn in the panel's native landscape orientation, matching KOReader's default. */
++static void show_splash(const char *status)
 +{
 +    if (!g_screen)
 +        return;
 +    memset(g_screen, 0xff, (size_t)KO_FB_WIDTH * KO_FB_HEIGHT * 4);
-+    /* Landscape: readable while the console is still held normally. */
-+    if (landscape_title)
-+        draw_text_centered(landscape_title, 48, 2, false, COLOR_TEXT);
-+    if (landscape_text)
-+        draw_text_centered(landscape_text, 96, 1, false, COLOR_ACCENT);
-+    /* Portrait: readable once the console has been turned. */
-+    draw_text_centered("KOReader", 520, 3, true, COLOR_TEXT);
-+    if (portrait_status)
-+        draw_text_centered(portrait_status, 600, strlen(portrait_status) <= 12 ? 2 : 1, true, COLOR_ACCENT);
++    draw_text_centered("KOReader", KO_FB_HEIGHT / 2 - 48, 4, false, COLOR_TEXT);
++    if (status)
++        draw_text_centered(status, KO_FB_HEIGHT / 2 + 40, 2, false, COLOR_ACCENT);
 +    ko_fb_present(g_screen, KO_FB_WIDTH, 0);
-+}
-+
-+static void show_splash(const char *status)
-+{
-+    show_screen(status,
-+                "Turn your Switch sideways",
-+                "Rotate it 90 degrees clockwise, with the power button on the right");
 +}
 +
 +/* Waits for a complete tap on the touch screen (ignoring a touch already in progress). */
