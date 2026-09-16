@@ -280,6 +280,22 @@ index 000000000..8a3ba3839
 +end
 +
 +return SwitchPowerD
+diff --git a/frontend/document/doccache.lua b/frontend/document/doccache.lua
+index e62ed780c..dde2bfbaf 100644
+--- a/frontend/document/doccache.lua
++++ b/frontend/document/doccache.lua
+@@ -66,7 +66,10 @@ function DocCache:serialize(doc_path)
+     local cached_size = 0
+     local sorted_caches = {}
+     for _, file in pairs(self.cached) do
+-        table.insert(sorted_caches, {file=file, time=lfs.attributes(file, "access")})
++        -- On some filesystems (e.g. the Switch's) lfs.attributes(..., "access") can be nil
++        -- (no access-time tracking, or the file was already evicted); default to 0 so the sort
++        -- below never compares a number with nil (which would abort serialization on exit).
++        table.insert(sorted_caches, {file=file, time=lfs.attributes(file, "access") or 0})
+         cached_size = cached_size + (lfs.attributes(file, "size") or 0)
+     end
+     table.sort(sorted_caches, function(v1, v2) return v1.time > v2.time end)
 diff --git a/frontend/ui/trapper.lua b/frontend/ui/trapper.lua
 index ee64b461f..44d0188ea 100644
 --- a/frontend/ui/trapper.lua
